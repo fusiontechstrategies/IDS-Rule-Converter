@@ -39,6 +39,7 @@ jobs:
           python snort_suricata_rule_converter.py convert tests/fixtures/engine_suricata.rules \
             --source-dialect suricata --target snort3 \
             --output generated/from-suricata.rules
+          chmod 0644 generated/*.rules
 
       - name: Validate with Snort 3.10.0.0
         shell: bash
