@@ -1,0 +1,1 @@
+alert tcp any any -> any 80 (msg:"Snort 3 engine fixture"; flow:to_server,established; http_uri; content:"/health",nocase; sid:9000002; rev:1;)

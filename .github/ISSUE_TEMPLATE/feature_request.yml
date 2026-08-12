@@ -1,0 +1,34 @@
+name: Feature request
+description: Propose a verified mapping, safety control, report, or workflow improvement
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow or compatibility gap should be addressed?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Explain the desired input, output, rejection behavior, and safety properties.
+    validations:
+      required: true
+
+  - type: textarea
+    id: references
+    attributes:
+      label: Primary documentation
+      description: Link official source and target engine documentation when proposing a conversion mapping.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I did not include credentials, private resource names, or proprietary rules.
+          required: true

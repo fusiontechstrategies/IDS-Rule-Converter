@@ -1,0 +1,67 @@
+name: Engine Validation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: engines-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  engines:
+    name: Native Snort and Suricata checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Generate cross-engine fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p generated
+          python snort_suricata_rule_converter.py convert tests/fixtures/engine_snort3.rules \
+            --source-dialect snort3 --target suricata \
+            --output generated/from-snort3.rules
+          python snort_suricata_rule_converter.py convert tests/fixtures/engine_suricata.rules \
+            --source-dialect suricata --target snort3 \
+            --output generated/from-suricata.rules
+
+      - name: Validate with Snort 3.10.0.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="ciscotalos/snort3@sha256:f15f714fd61ade114b1039687dd43352cae26cd6401b89f2b03404e0d21e322f"
+          for rules in tests/fixtures/engine_snort3.rules generated/from-suricata.rules; do
+            docker run --rm --network none --cap-drop ALL \
+              --security-opt no-new-privileges \
+              --volume "$PWD/$rules:/tmp/engine.rules:ro" \
+              --entrypoint /home/snorty/snort3/bin/snort "$image" \
+              -c /home/snorty/snort3/etc/snort/snort.lua \
+              -R /tmp/engine.rules -T
+          done
+
+      - name: Validate with Suricata 8.0.6
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="jasonish/suricata@sha256:581dca6c8cc8a8a2fafd3fff33368573b547b7600a22b21a18866da05727508f"
+          for rules in tests/fixtures/engine_suricata.rules generated/from-snort3.rules; do
+            docker run --rm --network none --cap-drop ALL \
+              --security-opt no-new-privileges --user suricata \
+              --volume "$PWD/$rules:/tmp/engine.rules:ro" "$image" \
+              -T -c /etc/suricata/suricata.yaml -S /tmp/engine.rules
+          done

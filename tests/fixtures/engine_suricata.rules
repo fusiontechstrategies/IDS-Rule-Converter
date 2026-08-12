@@ -1,0 +1,1 @@
+alert tcp any any -> any 80 (msg:"Suricata engine fixture"; flow:to_server,established; http.uri; content:"/health"; nocase; sid:9000001; rev:1;)

@@ -1,0 +1,37 @@
+# Local reference material and third-party content
+.local-reference/
+Snort3 Community Rules/
+*.pdf
+*.docx
+
+# Generated converter artifacts
+*-temp.*
+converted/
+downloads/
+reports/
+panorama_batch_*.rules
+panorama_preflight.json
+panorama_preflight.txt
+panorama_rejected.rules
+
+# Python
+__pycache__/
+*.py[cod]
+.coverage
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Packaging and editor artifacts
+build/
+dist/
+*.egg-info/
+.idea/
+.vscode/
+*.swp
+
+# Operating systems
+.DS_Store
+Thumbs.db
+Desktop.ini
