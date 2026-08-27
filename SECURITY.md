@@ -22,9 +22,9 @@ Use the repository's GitHub Security Advisory reporting feature:
 4. Include the affected version, reproduction steps, impact, and any proposed
    mitigation.
 
-If private vulnerability reporting is temporarily unavailable, contact the
-repository owner through the GitHub organization profile and request a private
-reporting channel. Do not include exploit details in that initial message.
+If private vulnerability reporting is temporarily unavailable, email
+jeff@fusiontsi.com and request a private reporting channel. Do not include
+exploit details in that initial message.
 
 Reports will be acknowledged as soon as practical. Confirmed issues will be
 triaged based on exploitability, data exposure, integrity impact, and deployment

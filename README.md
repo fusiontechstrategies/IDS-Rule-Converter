@@ -1,5 +1,10 @@
 # IDS Rule Converter
 
+[![CI](https://github.com/fusiontechstrategies/IDS-Rule-Converter/actions/workflows/ci.yml/badge.svg)](https://github.com/fusiontechstrategies/IDS-Rule-Converter/actions/workflows/ci.yml)
+[![Engine Validation](https://github.com/fusiontechstrategies/IDS-Rule-Converter/actions/workflows/engine-validation.yml/badge.svg)](https://github.com/fusiontechstrategies/IDS-Rule-Converter/actions/workflows/engine-validation.yml)
+[![Security](https://github.com/fusiontechstrategies/IDS-Rule-Converter/actions/workflows/security.yml/badge.svg)](https://github.com/fusiontechstrategies/IDS-Rule-Converter/actions/workflows/security.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+
 Stop guessing whether a converted IDS rule still means the same thing.
 
 IDS Rule Converter is a secure, loss-aware, one-file Python toolkit for parsing,
