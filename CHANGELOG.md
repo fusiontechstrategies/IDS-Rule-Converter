@@ -4,6 +4,20 @@ All notable changes to this project are documented here.
 
 The format follows Keep a Changelog, and versions follow Semantic Versioning.
 
+## [Unreleased]
+
+### Changed
+
+- Added scheduled CodeQL, Semgrep, Gitleaks, Trivy, Bandit, and dependency audits
+- Added staggered Dependabot schedules and update cooldowns
+- Added immutable checkout settings and weekly native-engine validation
+
+### Security
+
+- Prevented a race from replacing a newly created output when `--force` is absent
+- Rejected feed URLs and redirects containing credentials or nonstandard HTTPS ports
+- Added regression tests for output races and stricter feed URL validation
+
 ## [4.0.0] - 2026-08-12
 
 ### Added
@@ -35,3 +49,4 @@ The format follows Keep a Changelog, and versions follow Semantic Versioning.
 - Prevented accidental replacement of source input files
 
 [4.0.0]: https://github.com/fusiontechstrategies/IDS-Rule-Converter/releases/tag/v4.0.0
+[Unreleased]: https://github.com/fusiontechstrategies/IDS-Rule-Converter/compare/v4.0.0...HEAD

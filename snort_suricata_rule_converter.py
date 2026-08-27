@@ -596,9 +596,14 @@ def atomic_write_bytes(path: Path, data: bytes, force: bool = False) -> Path:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        if destination.exists() and not force:
-            raise ConverterError(f"Output already exists: {destination}")
-        os.replace(temporary, destination)
+        if force:
+            os.replace(temporary, destination)
+        else:
+            try:
+                os.link(temporary, destination)
+            except FileExistsError as exc:
+                raise ConverterError(f"Output already exists: {destination}") from exc
+            temporary.unlink()
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
@@ -2687,6 +2692,21 @@ def extract_archive(data: bytes, archive_type: str, output_dir: Path, force: boo
     return written
 
 
+def is_allowed_https_url(url: str, allowed_hosts: set[str]) -> bool:
+    try:
+        parsed = urllib.parse.urlparse(url)
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme.lower() == "https"
+        and (parsed.hostname or "").lower() in {item.lower() for item in allowed_hosts}
+        and parsed.username is None
+        and parsed.password is None
+        and port in {None, 443}
+    )
+
+
 class RestrictedRedirectHandler(urllib.request.HTTPRedirectHandler):
     def __init__(self, allowed_hosts: set[str]) -> None:
         super().__init__()
@@ -2701,11 +2721,7 @@ class RestrictedRedirectHandler(urllib.request.HTTPRedirectHandler):
         headers: Any,
         newurl: str,
     ) -> Any:
-        parsed = urllib.parse.urlparse(newurl)
-        if (
-            parsed.scheme.lower() != "https"
-            or (parsed.hostname or "").lower() not in self.allowed_hosts
-        ):
+        if not is_allowed_https_url(newurl, self.allowed_hosts):
             raise ConverterError(f"Refused redirect outside the HTTPS source allowlist: {newurl}")
         return super().redirect_request(request, fp, code, msg, headers, newurl)
 
@@ -2713,9 +2729,8 @@ class RestrictedRedirectHandler(urllib.request.HTTPRedirectHandler):
 def download_feed(source_name: str) -> tuple[bytes, dict[str, Any]]:
     source = FEEDS[source_name]
     url = str(source["url"])
-    parsed = urllib.parse.urlparse(url)
     allowed_hosts = set(source["hosts"])
-    if parsed.scheme != "https" or (parsed.hostname or "").lower() not in allowed_hosts:
+    if not is_allowed_https_url(url, allowed_hosts):
         raise ConverterError("Built-in feed URL failed its HTTPS allowlist check")
     context = ssl.create_default_context()
     opener = urllib.request.build_opener(
@@ -2733,11 +2748,11 @@ def download_feed(source_name: str) -> tuple[bytes, dict[str, Any]]:
     try:
         with opener.open(request, timeout=30) as response:
             final_url = response.geturl()
-            final = urllib.parse.urlparse(final_url)
-            if final.scheme != "https" or (final.hostname or "").lower() not in allowed_hosts:
+            if not is_allowed_https_url(final_url, allowed_hosts):
                 raise ConverterError(
                     f"Download ended outside the HTTPS source allowlist: {final_url}"
                 )
+            final = urllib.parse.urlparse(final_url)
             length_header = response.headers.get("Content-Length")
             if length_header:
                 try:

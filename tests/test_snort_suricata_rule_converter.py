@@ -8,6 +8,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -368,6 +369,23 @@ class FileAndArchiveSafetyTests(unittest.TestCase):
             converter.atomic_write_text(path, "two", force=True)
             self.assertEqual("two", path.read_text(encoding="utf-8"))
 
+    def test_atomic_write_does_not_clobber_a_racing_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "output.txt"
+
+            def create_competing_file(_source: str, destination: str) -> None:
+                Path(destination).write_text("competitor", encoding="utf-8")
+                raise FileExistsError
+
+            with (
+                mock.patch.object(converter.os, "link", side_effect=create_competing_file),
+                self.assertRaises(converter.ConverterError),
+            ):
+                converter.atomic_write_text(path, "tool output")
+
+            self.assertEqual("competitor", path.read_text(encoding="utf-8"))
+            self.assertEqual([path], list(Path(directory).iterdir()))
+
     def test_tar_path_traversal_is_rejected(self) -> None:
         stream = io.BytesIO()
         with tarfile.open(fileobj=stream, mode="w:gz") as archive:
@@ -440,6 +458,18 @@ class FileAndArchiveSafetyTests(unittest.TestCase):
         request = converter.urllib.request.Request("https://example.test/start")
         with self.assertRaises(converter.ConverterError):
             handler.redirect_request(request, None, 302, "Found", {}, "http://example.test/file")
+
+    def test_allowlisted_https_url_rejects_credentials_and_nonstandard_ports(self) -> None:
+        hosts = {"example.test"}
+        self.assertTrue(converter.is_allowed_https_url("https://example.test/file", hosts))
+        self.assertTrue(converter.is_allowed_https_url("https://example.test:443/file", hosts))
+        for url in (
+            "https://user@example.test/file",
+            "https://example.test:444/file",
+            "https://example.test:not-a-port/file",
+        ):
+            with self.subTest(url=url):
+                self.assertFalse(converter.is_allowed_https_url(url, hosts))
 
 
 class CliTests(unittest.TestCase):
