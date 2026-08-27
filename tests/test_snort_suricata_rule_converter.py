@@ -6,9 +6,9 @@ import sys
 import tarfile
 import tempfile
 import unittest
+import unittest.mock
 import zipfile
 from pathlib import Path
-from unittest import mock
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -378,7 +378,7 @@ class FileAndArchiveSafetyTests(unittest.TestCase):
                 raise FileExistsError
 
             with (
-                mock.patch.object(converter.os, "link", side_effect=create_competing_file),
+                unittest.mock.patch.object(converter.os, "link", side_effect=create_competing_file),
                 self.assertRaises(converter.ConverterError),
             ):
                 converter.atomic_write_text(path, "tool output")
