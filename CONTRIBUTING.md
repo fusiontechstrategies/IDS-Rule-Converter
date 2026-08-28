@@ -25,10 +25,10 @@ Run all local checks before opening a pull request:
 ```text
 python -m ruff format --check .
 python -m ruff check .
-python -m bandit -q -r snort_suricata_rule_converter.py
+python -m bandit -q -r snort_suricata_rule_converter.py scripts
 python -m pip_audit -r requirements-dev.txt
 python -m unittest discover -s tests -v
-python -m py_compile snort_suricata_rule_converter.py tests/test_snort_suricata_rule_converter.py
+python -m compileall -q snort_suricata_rule_converter.py scripts tests
 ```
 
 ## Conversion changes

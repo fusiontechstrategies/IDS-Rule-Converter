@@ -59,25 +59,76 @@ jobs:
         run: python -m ruff check .
 
       - name: Run security linter
-        run: python -m bandit -q -r snort_suricata_rule_converter.py
+        run: python -m bandit -q -r snort_suricata_rule_converter.py scripts
 
       - name: Audit development dependencies
         run: python -m pip_audit -r requirements-dev.txt
 
       - name: Compile
-        run: python -m py_compile snort_suricata_rule_converter.py tests/test_snort_suricata_rule_converter.py
+        run: python -m compileall -q snort_suricata_rule_converter.py scripts tests
 
       - name: Run tests
         run: python -m unittest discover -s tests -v
 
+  release-candidate:
+    name: Reproducible release candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Build candidate twice
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/prepare_release.py \
+            --version 4.0.1 \
+            --source-commit "$GITHUB_SHA" \
+            --output-dir candidate-one
+          python scripts/prepare_release.py \
+            --version 4.0.1 \
+            --source-commit "$GITHUB_SHA" \
+            --output-dir candidate-two
+
+      - name: Confirm byte-identical and exact assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          diff --recursive --brief candidate-one candidate-two
+          test "$(find candidate-one -maxdepth 1 -type f | wc -l)" -eq 5
+          test -f candidate-one/IDS-Rule-Converter-v4.0.1.py
+          test -f candidate-one/IDS-Rule-Converter-v4.0.1.zip
+          test -f candidate-one/IDS-Rule-Converter-v4.0.1.spdx.json
+          test -f candidate-one/SHA256SUMS.txt
+          test -f candidate-one/release-evidence.json
+
+      - name: Preserve candidate evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ids-rule-converter-candidate-${{ github.sha }}
+          path: candidate-one/*
+          if-no-files-found: error
+          retention-days: 30
+
   required:
     name: Required checks
     if: always()
-    needs: test
+    needs: [test, release-candidate]
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
       - name: Confirm matrix success
         env:
           TEST_RESULT: ${{ needs.test.result }}
-        run: test "$TEST_RESULT" = "success"
+          RELEASE_RESULT: ${{ needs.release-candidate.result }}
+        run: |
+          test "$TEST_RESULT" = "success"
+          test "$RELEASE_RESULT" = "success"

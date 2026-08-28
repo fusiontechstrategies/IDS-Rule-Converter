@@ -6,17 +6,22 @@ The format follows Keep a Changelog, and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [4.0.1] - 2026-08-28
+
 ### Changed
 
 - Added scheduled CodeQL, Semgrep, Gitleaks, Trivy, Bandit, and dependency audits
 - Added staggered Dependabot schedules and update cooldowns
 - Added immutable checkout settings and weekly native-engine validation
+- Added deterministic standalone, ZIP, SPDX 2.3 SBOM, checksum, and release-evidence assets
+- Added a tag-only workflow that creates a draft GitHub release with provenance attestations
 
 ### Security
 
 - Prevented a race from replacing a newly created output when `--force` is absent
 - Rejected feed URLs and redirects containing credentials or nonstandard HTTPS ports
 - Added regression tests for output races and stricter feed URL validation
+- Required repeatable release artifacts bound to the exact source commit
 
 ## [4.0.0] - 2026-08-12
 
@@ -48,5 +53,6 @@ The format follows Keep a Changelog, and versions follow Semantic Versioning.
   entry-count, file-size, and expanded-size defenses
 - Prevented accidental replacement of source input files
 
+[4.0.1]: https://github.com/fusiontechstrategies/IDS-Rule-Converter/compare/v4.0.0...v4.0.1
 [4.0.0]: https://github.com/fusiontechstrategies/IDS-Rule-Converter/releases/tag/v4.0.0
-[Unreleased]: https://github.com/fusiontechstrategies/IDS-Rule-Converter/compare/v4.0.0...HEAD
+[Unreleased]: https://github.com/fusiontechstrategies/IDS-Rule-Converter/compare/v4.0.1...HEAD

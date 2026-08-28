@@ -36,7 +36,7 @@ jobs:
       - name: Audit pinned development dependencies
         run: python -m pip_audit -r requirements-dev.txt
       - name: Scan Python source with Bandit
-        run: python -m bandit -q -r snort_suricata_rule_converter.py
+        run: python -m bandit -q -r snort_suricata_rule_converter.py scripts
 
   codeql:
     name: CodeQL security analysis

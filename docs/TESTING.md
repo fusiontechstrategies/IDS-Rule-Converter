@@ -1,11 +1,11 @@
 # Testing Record
 
-This document records the validation performed for IDS Rule Converter 4.0.0 on
-August 12, 2026.
+This document records the release-readiness model for IDS Rule Converter 4.0.1
+and preserves the separate large-corpus baseline completed for 4.0.0.
 
 ## Automated test suite
 
-The standard-library `unittest` suite contains 56 tests covering:
+The standard-library `unittest` suite contains 64 tests covering:
 
 - Multiline, multiple-rule, comment, quoted delimiter, and headerless parsing
 - Strict UTF-8 input and NUL-byte rejection
@@ -19,11 +19,13 @@ The standard-library `unittest` suite contains 56 tests covering:
 - Atomic writes, overwrite refusal, and input replacement prevention
 - TAR and ZIP traversal, links, duplicate paths, device paths, and safe extraction
 - HTTPS redirect allowlisting
+- Feed URL credential and port restrictions
+- Repository punctuation policy
+- Exact, deterministic release assets, checksums, SPDX metadata, and evidence
 
-The suite passed on Windows with Python 3.12 and 3.13. It also passed in an
-isolated Python 3.14 Linux container. The optional local third-party corpus test
-was skipped in that Python 3.14 container because ignored local references were
-not copied into it.
+The candidate suite runs in hosted CI on Linux with Python 3.10 through 3.14 and
+on Windows and macOS with Python 3.12. The optional local third-party corpus test
+is skipped because its vendor-owned inputs are deliberately not stored in Git.
 
 Python 3.14 image:
 
@@ -31,7 +33,17 @@ Python 3.14 image:
 python@sha256:ce40764625a4ff50df3548277632e7f96c4e77fe75fa848aae9885476e7df5a4
 ```
 
-## Snort native validation
+## 4.0.1 native fixture validation
+
+Every pull request and protected-main push converts the committed Snort 3 fixture
+to Suricata and the committed Suricata fixture to Snort 3. Both original fixtures
+and both generated outputs must pass the applicable native configuration test.
+
+The containers run without a network, with all Linux capabilities dropped, and
+with the no-new-privileges security option. Suricata runs as its non-root
+`suricata` user.
+
+## 4.0.0 large-corpus Snort validation
 
 Engine image:
 
@@ -50,7 +62,7 @@ file identification rules.
 The test container used no network, dropped all Linux capabilities, and enabled
 the no-new-privileges security option.
 
-## Suricata native validation
+## 4.0.0 large-corpus Suricata validation
 
 Engine image:
 
@@ -89,3 +101,25 @@ before deployment.
 
 Third-party test corpora and vendor documents are deliberately excluded from Git
 and remain subject to their owners' terms.
+
+## Release construction
+
+The candidate builder runs twice from the exact source commit. All five outputs
+must be byte-identical across both builds:
+
+- exact standalone runtime
+- deterministic documentation ZIP
+- SPDX 2.3 SBOM
+- SHA-256 checksum file
+- machine-readable release evidence
+
+The builder refuses a version mismatch, malformed commit identity, missing
+package file, missing versioned release notes, changelog mismatch, nonempty output
+directory, or attempted output replacement. Tests verify archive membership,
+portable relative paths, fixed timestamps, source-byte identity, checksums, SPDX
+identity, and evidence binding.
+
+The tag-only release workflow also requires the tag commit to be reachable from
+protected `main` and GitHub-verified. It creates provenance attestations and a
+draft release, then verifies the exact five-asset set. Publication remains a
+separate maintainer action.

@@ -16,6 +16,12 @@ The runtime has no third-party Python dependencies. Copy
 `snort_suricata_rule_converter.py` to a system with Python 3.10 or newer and run
 it directly.
 
+Version 4.0.1 is the current release candidate. Until its GitHub release lists
+the tested standalone asset, deterministic ZIP, SPDX SBOM, checksums, release
+evidence, and provenance, evaluate the source from this repository rather than
+a similarly named download. See [RELEASING.md](RELEASING.md) for the exact
+artifact and publication gates.
+
 ## Why this tool is different
 
 Rule conversion is not a keyword replacement problem. Sticky buffers, content
@@ -132,22 +138,26 @@ Apache 2.0 license.
 
 ## Test evidence
 
-Version 4.0.0 was validated on August 12, 2026 with:
+The 4.0.1 release-readiness tree contains 64 automated tests covering parsing,
+conversion, reports, Panorama checks, overwrite controls, URL and redirect
+policy, malicious archives, repository text policy, and deterministic release
+construction. CI exercises Python 3.10 through 3.14 on Linux, Python 3.12 on
+Windows and macOS, and both conversion directions against pinned Snort 3.10.0.0
+and Suricata 8.0.6 containers.
 
-- 56 automated tests covering parsing, conversion, reports, Panorama checks,
-  overwrite controls, redirect policy, and malicious archive cases
-- Python 3.12 and 3.13 on Windows, plus Python 3.14 in an isolated Linux container
-- Snort 3.10.0.0 native configuration validation in an isolated container
-- Suricata 8.0.6 native configuration validation in an isolated container
-- A 4,017-rule Cisco Talos Snort 3 community corpus round trip accepted by Snort
-  with zero warnings
-- A fail-safe Suricata conversion that accepted 3,762 rules and rejected 255
-  rules with recorded reasons
-- Native Suricata validation of all 3,762 accepted rules with zero errors
+The larger 4,017-rule Cisco Talos community corpus was validated for version
+4.0.0. Snort accepted the full same-dialect round trip with zero warnings. The
+fail-safe Suricata conversion accepted 3,762 rules, rejected 255 with recorded
+reasons, and passed native validation with zero errors. Suricata emitted 71
+nonfatal duplicate-buffer warnings for source patterns that intentionally revisit
+an earlier sticky buffer.
 
-The Suricata engine emitted 71 nonfatal duplicate-buffer warnings for source
-patterns that intentionally revisit an earlier sticky buffer. Full commands,
-container digests, and test scope are recorded in [docs/TESTING.md](docs/TESTING.md).
+Version 4.0.1 changes output-file race handling, feed URL validation, repository
+controls, and release construction. It does not change conversion semantics. The
+large third-party corpus has not been rerun for the candidate, so its result is
+kept explicitly separate from the current hosted native-fixture checks. Full
+commands, container digests, and scope are recorded in
+[docs/TESTING.md](docs/TESTING.md).
 
 ## Exit codes
 
@@ -164,7 +174,7 @@ container digests, and test scope are recorded in [docs/TESTING.md](docs/TESTING
 python -m pip install -r requirements-dev.txt
 python -m ruff format --check .
 python -m ruff check .
-python -m bandit -q -r snort_suricata_rule_converter.py
+python -m bandit -q -r snort_suricata_rule_converter.py scripts
 python -m pip_audit -r requirements-dev.txt
 python -m unittest discover -s tests -v
 ```
