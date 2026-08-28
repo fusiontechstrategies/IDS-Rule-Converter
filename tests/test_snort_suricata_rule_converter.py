@@ -574,5 +574,48 @@ class LocalCorpusTests(unittest.TestCase):
         )
 
 
+class RepositoryQualityTests(unittest.TestCase):
+    def test_repository_text_contains_no_em_dash(self) -> None:
+        excluded_directories = {
+            ".git",
+            ".local-reference",
+            ".mypy_cache",
+            ".pytest_cache",
+            ".ruff_cache",
+            ".venv",
+            "__pycache__",
+        }
+        text_suffixes = {
+            ".cfg",
+            ".css",
+            ".html",
+            ".ini",
+            ".js",
+            ".json",
+            ".md",
+            ".py",
+            ".rst",
+            ".rules",
+            ".sh",
+            ".toml",
+            ".txt",
+            ".xml",
+            ".yaml",
+            ".yml",
+        }
+        offenders = []
+
+        for path in PROJECT_ROOT.rglob("*"):
+            relative_path = path.relative_to(PROJECT_ROOT)
+            if not path.is_file() or excluded_directories.intersection(relative_path.parts):
+                continue
+            if path.suffix.lower() not in text_suffixes:
+                continue
+            if chr(0x2014) in path.read_text(encoding="utf-8"):
+                offenders.append(str(relative_path))
+
+        self.assertEqual([], offenders)
+
+
 if __name__ == "__main__":
     unittest.main()
