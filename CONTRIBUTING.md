@@ -9,6 +9,7 @@ Thank you for helping improve IDS Rule Converter.
 - Keep the production runtime in one Python file.
 - Use only the Python standard library at runtime.
 - Keep inputs local unless the operator explicitly invokes `fetch`.
+- Use ASCII punctuation and do not introduce em dashes.
 - Do not commit third-party rule corpora, vendor documents, credentials, or
   environment-specific resource names.
 
