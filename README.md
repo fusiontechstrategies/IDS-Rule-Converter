@@ -71,6 +71,15 @@ python snort_suricata_rule_converter.py convert input.rules --source-dialect sno
 An intentional partial result exits with code 2 so automation cannot mistake it
 for a complete conversion.
 
+### Strict and reviewed partial results
+
+![Synthetic two-rule IDS conversion comparison showing strict mode writing no ruleset and reviewed partial mode separating one accepted rule, one rejected rule, and a JSON report while returning exit code 2.](docs/images/ids-rule-converter-safety-comparison.png)
+
+Constructed test data. Strict mode writes no converted ruleset when one mapping
+is unsafe. An explicit partial export preserves accepted rules, rejected source
+rules, and the report as one review set. Native target validation is still
+required.
+
 ## Commands
 
 | Command | Purpose |
