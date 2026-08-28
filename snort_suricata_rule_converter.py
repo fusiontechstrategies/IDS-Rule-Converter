@@ -30,8 +30,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 APP_NAME = "IDS Rule Converter"
-VERSION = "4.0.0"
-BUILD_DATE = "2026-08-12"
+VERSION = "4.0.1"
+BUILD_DATE = "2026-08-28"
 
 EXIT_OK = 0
 EXIT_OPERATIONAL_ERROR = 1
