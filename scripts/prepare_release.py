@@ -154,7 +154,11 @@ def build_spdx(version: str, identity: RuntimeIdentity, files: dict[str, bytes])
     for index, relative_name in enumerate(sorted(files), start=1):
         data = files[relative_name]
         file_id = spdx_id(index)
-        sha1 = hashlib.sha1(data, usedforsecurity=False).hexdigest()
+        # SPDX 2.3 defines SHA-1 for package verification. It is an inventory
+        # identifier, not a security decision, and every file also records SHA-256.
+        sha1 = hashlib.sha1(  # nosemgrep: python.lang.security.insecure-hash-algorithms.insecure-hash-algorithm-sha1
+            data, usedforsecurity=False
+        ).hexdigest()
         file_sha1_values.append(sha1)
         file_records.append(
             {
@@ -178,7 +182,9 @@ def build_spdx(version: str, identity: RuntimeIdentity, files: dict[str, bytes])
         )
 
     verification_input = "".join(sorted(file_sha1_values)).encode("ascii")
-    package_verification = hashlib.sha1(verification_input, usedforsecurity=False).hexdigest()
+    package_verification = hashlib.sha1(  # nosemgrep: python.lang.security.insecure-hash-algorithms.insecure-hash-algorithm-sha1
+        verification_input, usedforsecurity=False
+    ).hexdigest()
     runtime_digest = sha256_bytes(files[RUNTIME_SOURCE])
     document = {
         "SPDXID": "SPDXRef-DOCUMENT",
