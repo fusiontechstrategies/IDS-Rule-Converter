@@ -16,12 +16,12 @@ The runtime has no third-party Python dependencies. Copy
 `snort_suricata_rule_converter.py` to a system with Python 3.10 or newer and run
 it directly.
 
-Version 4.0.1 is the current release. Download the verified
-[standalone Python runtime](https://github.com/fusiontechstrategies/IDS-Rule-Converter/releases/download/v4.0.1/IDS-Rule-Converter-v4.0.1.py)
+Version 4.0.2 is the current release. Download the verified
+[standalone Python runtime](https://github.com/fusiontechstrategies/IDS-Rule-Converter/releases/download/v4.0.2/IDS-Rule-Converter-v4.0.2.py)
 or the deterministic
-[documentation ZIP](https://github.com/fusiontechstrategies/IDS-Rule-Converter/releases/download/v4.0.1/IDS-Rule-Converter-v4.0.1.zip).
-The [release page](https://github.com/fusiontechstrategies/IDS-Rule-Converter/releases/tag/v4.0.1)
-also provides the SPDX SBOM, SHA-256 checksums, release evidence, and GitHub
+[documentation ZIP](https://github.com/fusiontechstrategies/IDS-Rule-Converter/releases/download/v4.0.2/IDS-Rule-Converter-v4.0.2.zip).
+The [release page](https://github.com/fusiontechstrategies/IDS-Rule-Converter/releases/tag/v4.0.2)
+also provides a Python wheel and source archive, the SPDX SBOM, SHA-256 checksums, release evidence, and GitHub
 provenance. See [RELEASING.md](RELEASING.md) for the exact artifact and
 publication gates.
 
