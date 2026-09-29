@@ -92,3 +92,9 @@ Before publishing the draft:
 - confirm the release notes state the current validation and residual limits accurately
 
 Publish only after every check passes. After publication, repeat the download and verification against the public URLs, then record the metrics baseline without treating automated downloads as users.
+
+## PyPI publication
+
+The manually dispatched `.github/workflows/publish.yml` accepts an existing public, non-prerelease GitHub release tag. Its verification job checks the protected-main ancestry and GitHub commit verification, exact seven-asset release set, SHA-256 manifest, release evidence, distribution contents, runtime source match, and GitHub provenance for every asset. Only the verified wheel and source archive are transferred to the separate upload job.
+
+The upload job uses a protected `pypi` environment and PyPI trusted publishing with a short-lived OpenID Connect credential. No PyPI API token belongs in repository secrets. Before the first upload, confirm that `ids-rule-converter` is available on PyPI, configure the exact `fusiontechstrategies/IDS-Rule-Converter` repository, `publish.yml` workflow, and `pypi` environment as a pending trusted publisher, and require maintainer approval for the GitHub environment. Review the verification job before approving the upload. After publication, compare PyPI wheel and source hashes with the GitHub assets and run the installed CLI from a clean environment.
