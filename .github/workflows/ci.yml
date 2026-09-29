@@ -85,17 +85,34 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install pinned distribution build tools
+        run: python -m pip install --disable-pip-version-check -r requirements-build.txt
+
+      - name: Build and verify package distributions
+        shell: bash
+        run: |
+          set -euo pipefail
+          epoch="$(git show -s --format=%ct HEAD)"
+          export SOURCE_DATE_EPOCH="$epoch"
+          python -m build --no-isolation --wheel --sdist --outdir package-dist
+          python scripts/normalize_wheel.py --source-date-epoch "$epoch" package-dist/*.whl
+          python scripts/normalize_sdist.py --source-date-epoch "$epoch" package-dist/*.tar.gz
+          python scripts/verify_distribution.py package-dist --version 4.0.2
+          python -m twine check package-dist/*
+
       - name: Build candidate twice
         shell: bash
         run: |
           set -euo pipefail
           python scripts/prepare_release.py \
-            --version 4.0.1 \
+            --version 4.0.2 \
             --source-commit "$GITHUB_SHA" \
+            --dist-dir package-dist \
             --output-dir candidate-one
           python scripts/prepare_release.py \
-            --version 4.0.1 \
+            --version 4.0.2 \
             --source-commit "$GITHUB_SHA" \
+            --dist-dir package-dist \
             --output-dir candidate-two
 
       - name: Confirm byte-identical and exact assets
@@ -103,10 +120,12 @@ jobs:
         run: |
           set -euo pipefail
           diff --recursive --brief candidate-one candidate-two
-          test "$(find candidate-one -maxdepth 1 -type f | wc -l)" -eq 5
-          test -f candidate-one/IDS-Rule-Converter-v4.0.1.py
-          test -f candidate-one/IDS-Rule-Converter-v4.0.1.zip
-          test -f candidate-one/IDS-Rule-Converter-v4.0.1.spdx.json
+          test "$(find candidate-one -maxdepth 1 -type f | wc -l)" -eq 7
+          test -f candidate-one/IDS-Rule-Converter-v4.0.2.py
+          test -f candidate-one/IDS-Rule-Converter-v4.0.2.zip
+          test -f candidate-one/ids_rule_converter-4.0.2-py3-none-any.whl
+          test -f candidate-one/ids_rule_converter-4.0.2.tar.gz
+          test -f candidate-one/IDS-Rule-Converter-v4.0.2.spdx.json
           test -f candidate-one/SHA256SUMS.txt
           test -f candidate-one/release-evidence.json
 
@@ -152,7 +171,7 @@ jobs:
           python -m build --no-isolation --wheel --sdist --outdir package-dist
           python scripts/normalize_wheel.py --source-date-epoch "$epoch" package-dist/*.whl
           python scripts/normalize_sdist.py --source-date-epoch "$epoch" package-dist/*.tar.gz
-          python scripts/verify_distribution.py package-dist --version 4.0.1
+          python scripts/verify_distribution.py package-dist --version 4.0.2
           python -m twine check package-dist/*
           python -m build --no-isolation --wheel --sdist --outdir package-repeat
           python scripts/normalize_wheel.py --source-date-epoch "$epoch" package-repeat/*.whl
