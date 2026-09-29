@@ -13,6 +13,7 @@ The format follows Keep a Changelog, and versions follow Semantic Versioning.
 - Installable `ids-rule-converter` CLI from a wheel or source distribution
 - Deterministic, reviewed wheel and source assets in the GitHub release
 - Distribution qualification gate before public package publication
+- Package metadata no longer assigns an unsupported Beta maturity label
 
 ### Changed
 
