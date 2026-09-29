@@ -25,6 +25,13 @@ also provides a Python wheel and source archive, the SPDX SBOM, SHA-256 checksum
 provenance. See [RELEASING.md](RELEASING.md) for the exact artifact and
 publication gates.
 
+For an installed command, use the [PyPI 4.0.2 package](https://pypi.org/project/ids-rule-converter/4.0.2/):
+
+```text
+python -m pip install ids-rule-converter==4.0.2
+ids-rule-converter --help
+```
+
 ## Why this tool is different
 
 Rule conversion is not a keyword replacement problem. Sticky buffers, content
