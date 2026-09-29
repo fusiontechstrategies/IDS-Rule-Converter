@@ -31,6 +31,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install pinned distribution build tools
+        run: python -m pip install --disable-pip-version-check -r requirements-build.txt
+
       - name: Resolve and validate release identity
         id: identity
         shell: bash
@@ -63,11 +66,18 @@ jobs:
           RELEASE_COMMIT: ${{ steps.identity.outputs.commit }}
         run: |
           set -euo pipefail
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$RELEASE_COMMIT")"
+          python -m build --no-isolation --wheel --sdist --outdir package-dist
+          python scripts/normalize_wheel.py --source-date-epoch "$SOURCE_DATE_EPOCH" package-dist/*.whl
+          python scripts/normalize_sdist.py --source-date-epoch "$SOURCE_DATE_EPOCH" package-dist/*.tar.gz
+          python scripts/verify_distribution.py package-dist --version "$RELEASE_VERSION"
+          python -m twine check package-dist/*
           python scripts/prepare_release.py \
             --version "$RELEASE_VERSION" \
             --source-commit "$RELEASE_COMMIT" \
+            --dist-dir package-dist \
             --output-dir dist
-          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 5
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 7
 
       - name: Attest release assets
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -91,6 +101,8 @@ jobs:
             --notes-file ".github/release-notes/$GITHUB_REF_NAME.md" \
             "dist/IDS-Rule-Converter-v$RELEASE_VERSION.py" \
             "dist/IDS-Rule-Converter-v$RELEASE_VERSION.zip" \
+            "dist/ids_rule_converter-$RELEASE_VERSION-py3-none-any.whl" \
+            "dist/ids_rule_converter-$RELEASE_VERSION.tar.gz" \
             "dist/IDS-Rule-Converter-v$RELEASE_VERSION.spdx.json" \
             "dist/SHA256SUMS.txt" \
             "dist/release-evidence.json"
@@ -114,6 +126,8 @@ jobs:
           expected = {
               f"IDS-Rule-Converter-v{version}.py",
               f"IDS-Rule-Converter-v{version}.zip",
+              f"ids_rule_converter-{version}-py3-none-any.whl",
+              f"ids_rule_converter-{version}.tar.gz",
               f"IDS-Rule-Converter-v{version}.spdx.json",
               "SHA256SUMS.txt",
               "release-evidence.json",

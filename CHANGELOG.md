@@ -6,6 +6,18 @@ The format follows Keep a Changelog, and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [4.0.2] - 2026-09-29
+
+### Added
+
+- Installable `ids-rule-converter` CLI from a wheel or source distribution
+- Deterministic, reviewed wheel and source assets in the GitHub release
+- Distribution qualification gate before public package publication
+
+### Changed
+
+- No rule-conversion behavior changes; existing standalone usage remains supported
+
 ## [4.0.1] - 2026-08-28
 
 ### Changed
@@ -55,4 +67,5 @@ The format follows Keep a Changelog, and versions follow Semantic Versioning.
 
 [4.0.1]: https://github.com/fusiontechstrategies/IDS-Rule-Converter/compare/v4.0.0...v4.0.1
 [4.0.0]: https://github.com/fusiontechstrategies/IDS-Rule-Converter/releases/tag/v4.0.0
-[Unreleased]: https://github.com/fusiontechstrategies/IDS-Rule-Converter/compare/v4.0.1...HEAD
+[4.0.2]: https://github.com/fusiontechstrategies/IDS-Rule-Converter/compare/v4.0.1...v4.0.2
+[Unreleased]: https://github.com/fusiontechstrategies/IDS-Rule-Converter/compare/v4.0.2...HEAD

@@ -10,17 +10,25 @@ from pathlib import Path
 from scripts import prepare_release
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-VERSION = "4.0.1"
+VERSION = "4.0.2"
 SOURCE_COMMIT = "a" * 40
 
 
 class ReleasePreparationTests(unittest.TestCase):
+    def distribution_fixture(self, parent: Path) -> Path:
+        dist = parent / "distribution-fixture"
+        dist.mkdir(exist_ok=True)
+        (dist / f"ids_rule_converter-{VERSION}-py3-none-any.whl").write_bytes(b"wheel fixture")
+        (dist / f"ids_rule_converter-{VERSION}.tar.gz").write_bytes(b"source fixture")
+        return dist
+
     def build(self, parent: Path, name: str) -> tuple[Path, ...]:
         return prepare_release.prepare_release(
             PROJECT_ROOT,
             parent / name,
             VERSION,
             SOURCE_COMMIT,
+            self.distribution_fixture(parent),
         )
 
     def test_repeat_builds_are_byte_identical_and_exact(self) -> None:
@@ -51,7 +59,7 @@ class ReleasePreparationTests(unittest.TestCase):
             )
 
             lines = by_name["SHA256SUMS.txt"].read_text(encoding="ascii").splitlines()
-            self.assertEqual(3, len(lines))
+            self.assertEqual(5, len(lines))
             for line in lines:
                 digest, name = line.split("  ", maxsplit=1)
                 self.assertEqual(hashlib.sha256(by_name[name].read_bytes()).hexdigest(), digest)
@@ -104,8 +112,9 @@ class ReleasePreparationTests(unittest.TestCase):
                 prepare_release.prepare_release(
                     PROJECT_ROOT,
                     parent / "mismatch",
-                    "4.0.2",
+                    "4.0.3",
                     SOURCE_COMMIT,
+                    self.distribution_fixture(parent),
                 )
             with self.assertRaises(prepare_release.ReleaseError):
                 prepare_release.prepare_release(
@@ -113,13 +122,20 @@ class ReleasePreparationTests(unittest.TestCase):
                     parent / "bad-commit",
                     VERSION,
                     "A" * 40,
+                    self.distribution_fixture(parent),
                 )
 
             occupied = parent / "occupied"
             occupied.mkdir()
             (occupied / "existing.txt").write_text("preserve", encoding="utf-8")
             with self.assertRaises(prepare_release.ReleaseError):
-                prepare_release.prepare_release(PROJECT_ROOT, occupied, VERSION, SOURCE_COMMIT)
+                prepare_release.prepare_release(
+                    PROJECT_ROOT,
+                    occupied,
+                    VERSION,
+                    SOURCE_COMMIT,
+                    self.distribution_fixture(parent),
+                )
             self.assertEqual("preserve", (occupied / "existing.txt").read_text(encoding="utf-8"))
 
 

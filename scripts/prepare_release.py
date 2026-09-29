@@ -87,6 +87,8 @@ def expected_asset_names(version: str) -> tuple[str, ...]:
     return (
         f"{stem}.py",
         f"{stem}.zip",
+        f"ids_rule_converter-{version}-py3-none-any.whl",
+        f"ids_rule_converter-{version}.tar.gz",
         f"{stem}.spdx.json",
         "SHA256SUMS.txt",
         "release-evidence.json",
@@ -220,7 +222,7 @@ def build_spdx(version: str, identity: RuntimeIdentity, files: dict[str, bytes])
 
 
 def prepare_release(
-    project_root: Path, output_dir: Path, version: str, source_commit: str
+    project_root: Path, output_dir: Path, version: str, source_commit: str, dist_dir: Path
 ) -> tuple[Path, ...]:
     if not STABLE_VERSION.fullmatch(version):
         raise ReleaseError("Release version must be a stable semantic version")
@@ -249,17 +251,24 @@ def prepare_release(
 
     files = validate_package_files(project_root)
     asset_names = expected_asset_names(version)
+    distribution_names = {asset_names[2], asset_names[3]}
+    if not dist_dir.is_dir() or {path.name for path in dist_dir.iterdir()} != distribution_names:
+        raise ReleaseError("Distribution directory must contain the exact wheel and source archive")
     runtime_asset = output_dir / asset_names[0]
     zip_asset = output_dir / asset_names[1]
-    spdx_asset = output_dir / asset_names[2]
-    checksums_asset = output_dir / asset_names[3]
-    evidence_asset = output_dir / asset_names[4]
+    wheel_asset = output_dir / asset_names[2]
+    sdist_asset = output_dir / asset_names[3]
+    spdx_asset = output_dir / asset_names[4]
+    checksums_asset = output_dir / asset_names[5]
+    evidence_asset = output_dir / asset_names[6]
 
     write_exclusive(runtime_asset, files[RUNTIME_SOURCE])
     build_zip(zip_asset, version, files)
+    write_exclusive(wheel_asset, (dist_dir / wheel_asset.name).read_bytes())
+    write_exclusive(sdist_asset, (dist_dir / sdist_asset.name).read_bytes())
     write_exclusive(spdx_asset, build_spdx(version, identity, files))
 
-    primary_assets = (runtime_asset, zip_asset, spdx_asset)
+    primary_assets = (runtime_asset, zip_asset, wheel_asset, sdist_asset, spdx_asset)
     checksum_lines = [f"{sha256_file(path)}  {path.name}" for path in primary_assets]
     write_exclusive(checksums_asset, ("\n".join(checksum_lines) + "\n").encode("ascii"))
 
@@ -299,6 +308,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--source-commit", required=True, help="Exact lowercase 40-character commit"
     )
     parser.add_argument("--output-dir", type=Path, required=True, help="Empty output directory")
+    parser.add_argument(
+        "--dist-dir", type=Path, required=True, help="Verified wheel and source archive"
+    )
     return parser
 
 
@@ -307,7 +319,11 @@ def main() -> int:
     project_root = Path(__file__).resolve().parents[1]
     try:
         outputs = prepare_release(
-            project_root, args.output_dir.resolve(), args.version, args.source_commit
+            project_root,
+            args.output_dir.resolve(),
+            args.version,
+            args.source_commit,
+            args.dist_dir.resolve(),
         )
     except (OSError, ReleaseError, UnicodeError, zipfile.BadZipFile) as exc:
         raise SystemExit(f"Release preparation failed: {exc}") from exc
