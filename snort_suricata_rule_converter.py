@@ -634,13 +634,16 @@ def atomic_write_bytes(path: Path, data: bytes, force: bool = False) -> Path:
                     temporary_name, destination.name, src_dir_fd=directory, dst_dir_fd=directory
                 )
             else:
-                os.link(
-                    temporary_name,
-                    destination.name,
-                    src_dir_fd=directory,
-                    dst_dir_fd=directory,
-                    follow_symlinks=False,
-                )
+                try:
+                    os.link(
+                        temporary_name,
+                        destination.name,
+                        src_dir_fd=directory,
+                        dst_dir_fd=directory,
+                        follow_symlinks=False,
+                    )
+                except FileExistsError as exc:
+                    raise ConverterError(f"Output already exists: {destination}") from exc
         finally:
             with suppress(FileNotFoundError):
                 os.unlink(temporary_name, dir_fd=directory)
