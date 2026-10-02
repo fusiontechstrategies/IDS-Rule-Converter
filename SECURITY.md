@@ -93,8 +93,13 @@ Snort 2 sticky payload contexts remain independent from backward content modifie
 including auto-detected `file_data` and the decoded Base64 buffer. Every
 one-shot backward content group restores the source payload context before any
 later non-modifier, including actual Base64 decoding and buffer-size tests.
-Cursor-relative operations that cannot cross that restoration safely are refused
-in strict, non-strict and direct rendering paths. Every
+Cursor provenance remains independent from buffer selection across flow, metadata
+and other intervening options. Generated restoration cannot recover an earlier
+pattern cursor. Relative consumers and relative content are refused until a real
+positive content match or explicit source buffer selection establishes a safe
+cursor; a negative match does not establish one. All refusals apply in strict,
+non-strict and direct rendering paths. Direct rendering also refuses unsupported
+relative, negated, empty or inclusive-range bufferlen mappings to bsize. Every
 unquoted option semicolon is a delimiter, including inside brackets or parentheses.
 Quoted content remains intact. Panorama writes no batches or completion manifest
 when any input record fails parsing.

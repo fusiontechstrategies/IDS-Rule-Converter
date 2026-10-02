@@ -138,6 +138,105 @@ class ConversionBoundaries(unittest.TestCase):
             with self.assertRaisesRegex(app.ConverterError, "cannot preserve its cursor"):
                 app.render_rule(parsed.rules[0], "suricata", source_dialect="snort2")
 
+    def test_neutral_options_do_not_erase_backward_pattern_cursor_provenance(self):
+        operations = (
+            'pcre:"/x/R";',
+            "byte_extract:1,0,var,relative;",
+            "byte_jump:1,0,relative;",
+            "byte_math:bytes 1, offset 0, oper +, rvalue 1, result x, relative;",
+            "byte_test:1,=,1,0,relative;",
+            "isdataat:1,relative;",
+            "base64_decode:bytes 8, offset 0, relative;",
+            "asn1:oversize_length 500,relative_offset 0;",
+            "bufferlen:10,relative;",
+            'content:"next"; distance:0;',
+            'content:"next"; within:8;',
+        )
+        for selector in ("", "file_data;", "base64_decode:bytes 8; base64_data;"):
+            for neutral in (
+                "flow:to_server;",
+                'metadata:service http; msg:"control";',
+                'flow:to_server; content:!"absent";',
+                'flow:to_server; content:!"absent"; http_uri;',
+            ):
+                for operation in operations:
+                    parsed = app.RuleParser().parse_text(
+                        f'alert tcp any any -> any any ({selector}content:"anchor"; http_uri; {neutral} {operation} sid:1001;)'
+                    )
+                    self.assertFalse(parsed.errors)
+                    for target in ("suricata", "snort3"):
+                        for strict in (True, False):
+                            result = app.convert_rules(
+                                parsed.rules, target, strict=strict, source_dialect="snort2"
+                            )
+                            self.assertEqual(result.rules, [], (selector, neutral, operation))
+                            self.assertTrue(result.errors)
+                            self.assertEqual(result.rejected_rule_indexes, [1])
+                        with self.assertRaises(app.ConverterError):
+                            app.render_rule(parsed.rules[0], target, source_dialect="snort2")
+
+        # A real positive absolute match in the restored payload establishes a
+        # new cursor. A negative match above does not establish one.
+        for selector in ("", "file_data;", "base64_decode:bytes 8; base64_data;"):
+            for operation in operations[:7] + operations[9:]:
+                parsed = app.RuleParser().parse_text(
+                    f'alert tcp any any -> any any ({selector}content:"anchor"; http_uri; flow:to_server; content:"fresh"; {operation} sid:1001;)'
+                )
+                for target in ("suricata", "snort3"):
+                    for strict in (True, False):
+                        result = app.convert_rules(
+                            parsed.rules, target, strict=strict, source_dialect="snort2"
+                        )
+                        self.assertFalse(result.errors, (target, operation, result.errors))
+                        self.assertEqual(len(result.rules), 1)
+                    self.assertIn("fresh", app.render_rule(parsed.rules[0], target, "snort2"))
+
+        # Two backward-selected contents can safely share their own URI cursor.
+        parsed = app.RuleParser().parse_text(
+            'alert tcp any any -> any any (content:"anchor"; http_uri; content:"next"; http_uri; distance:0; sid:1001;)'
+        )
+        self.assertFalse(
+            app.convert_rules(parsed.rules, "suricata", source_dialect="snort2").errors
+        )
+        # Restoring away from URI for a neutral option already resets the target
+        # cursor; switching back cannot recover it for another relative URI match.
+        parsed = app.RuleParser().parse_text(
+            'alert tcp any any -> any any (content:"anchor"; http_uri; flow:to_server; content:"next"; http_uri; distance:0; sid:1001;)'
+        )
+        for target in ("suricata", "snort3"):
+            self.assertTrue(app.convert_rules(parsed.rules, target, source_dialect="snort2").errors)
+            with self.assertRaises(app.ConverterError):
+                app.render_rule(parsed.rules[0], target, "snort2")
+        for modifier in ('replace:"fresh";', "distance:0;", "within:8;", "nocase;"):
+            parsed = app.RuleParser().parse_text(
+                f'alert tcp any any -> any any (content:"anchor"; http_uri; flow:to_server; {modifier} sid:1001;)'
+            )
+            for target in ("suricata", "snort3"):
+                self.assertTrue(
+                    app.convert_rules(parsed.rules, target, source_dialect="snort2").errors
+                )
+                with self.assertRaises(app.ConverterError):
+                    app.render_rule(parsed.rules[0], target, "snort2")
+
+    def test_direct_bufferlen_mapping_refuses_the_same_unsupported_forms(self):
+        for option in (
+            "bufferlen;",
+            "bufferlen:!10;",
+            "bufferlen:1<=>10;",
+            "bufferlen:10,relative;",
+        ):
+            parsed = app.RuleParser().parse_text(
+                f'alert tcp any any -> any any (content:"anchor"; {option} sid:1001;)'
+            )
+            for strict in (True, False):
+                self.assertTrue(app.convert_rules(parsed.rules, "suricata", strict=strict).errors)
+            with self.assertRaisesRegex(app.ConverterError, "bufferlen cannot safely map"):
+                app.render_rule(parsed.rules[0], "suricata")
+        parsed = app.RuleParser().parse_text(
+            'alert tcp any any -> any any (content:"anchor"; bufferlen:10; sid:1001;)'
+        )
+        self.assertIn("bsize:10;", app.render_rule(parsed.rules[0], "suricata"))
+
     def test_replace_is_rejected_only_when_sip_displaces_its_source_pattern(self):
         for shorthand in ("sip_method:INFO;", "sip_stat_code:200;"):
             for dialect in ("auto", "snort2", "snort3"):

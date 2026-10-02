@@ -1960,43 +1960,76 @@ def transform_snort2_to_snort3(options: Sequence[RuleOption]) -> list[RuleOption
     transformed: list[RuleOption] = []
     active_buffer = "pkt_data"
     payload_buffer = "pkt_data"
+    # Generated selector restoration does not restore the source pattern cursor.
+    # Keep its buffer provenance across flow, metadata and other neutral options.
+    cursor_buffer = "pkt_data"
+    cursor_preserved = True
+    pattern_displaced = False
     for index, option in enumerate(options):
         if index in associated_buffers:
             continue
         if option.key == "content":
             buffer_index = associations.get(index)
             desired = options[buffer_index].key if buffer_index is not None else payload_buffer
+            cursor = index + 1
+            relative_pattern = False
+            while cursor < len(options) and (
+                options[cursor].key in CONTENT_MODIFIERS or cursor == buffer_index
+            ):
+                relative_pattern |= options[cursor].key in {"distance", "within"}
+                cursor += 1
+            if relative_pattern and (cursor_buffer != desired or not cursor_preserved):
+                raise ConverterError(
+                    "Relative content after a backward Snort 2 content modifier cannot preserve its cursor"
+                )
             if desired != active_buffer:
                 transformed.append(RuleOption(desired, None, desired))
                 active_buffer = desired
+                cursor_preserved = False
             transformed.append(option)
+            pattern_displaced = False
+            if option.value is not None and not option.value.lstrip().startswith("!"):
+                cursor_buffer = desired
+                cursor_preserved = True
             continue
         if option.key in {"file_data", "pkt_data", "raw_data", "base64_data"}:
             transformed.append(option)
             active_buffer = option.key
             payload_buffer = option.key
+            cursor_buffer = option.key
+            cursor_preserved = True
             continue
+        if pattern_displaced and option.key in DISPLACED_PATTERN_MODIFIERS:
+            raise ConverterError(
+                "Displaced pattern modifier after a backward Snort 2 content group cannot preserve its pattern"
+            )
         # A backward modifier belongs only to its source content group. Restore
         # before any subsequent non-modifier instead of listing payload consumers.
         # Cursor-relative consumers cannot be moved safely between these buffers.
-        if option.key not in DISPLACED_PATTERN_MODIFIERS and active_buffer != payload_buffer:
-            if (
-                option.key == "pcre"
-                and option.value is not None
-                and "R" in pcre_flags(option.value)
-            ) or (
+        if option.key not in DISPLACED_PATTERN_MODIFIERS:
+            if (cursor_buffer != payload_buffer or not cursor_preserved) and (
                 (
-                    option.key.startswith("byte_")
-                    or option.key in {"isdataat", "base64_decode", "asn1", "bufferlen"}
+                    option.key == "pcre"
+                    and option.value is not None
+                    and "R" in pcre_flags(option.value)
                 )
-                and option.value is not None
-                and re.search(r"\brelative(?:_offset)?\b", option.value.lower()) is not None
+                or (
+                    (
+                        option.key.startswith("byte_")
+                        or option.key in {"isdataat", "base64_decode", "asn1", "bufferlen"}
+                    )
+                    and option.value is not None
+                    and re.search(r"\brelative(?:_offset)?\b", option.value.lower()) is not None
+                )
             ):
                 raise ConverterError(
                     "Relative payload operation after a backward Snort 2 content modifier cannot preserve its cursor"
                 )
-            transformed.append(RuleOption(payload_buffer, None, payload_buffer))
-            active_buffer = payload_buffer
+            if active_buffer != payload_buffer:
+                transformed.append(RuleOption(payload_buffer, None, payload_buffer))
+                active_buffer = payload_buffer
+                cursor_preserved = False
+                pattern_displaced = True
         transformed.append(option)
     return transformed
 
@@ -2165,6 +2198,14 @@ def transform_to_suricata(
                     RuleOption("app-layer-protocol", service, option.raw, option.origin)
                 )
         elif key == "bufferlen":
+            value = option.value or ""
+            if (
+                not value
+                or ",relative" in value.replace(" ", "").lower()
+                or "<=>" in value
+                or value.lstrip().startswith("!")
+            ):
+                raise ConverterError("bufferlen cannot safely map to Suricata bsize")
             transformed.append(RuleOption("bsize", option.value, option.raw, option.origin))
         elif key == "tag" and option.value is not None:
             value = mapped_suricata_tag(option.value)
