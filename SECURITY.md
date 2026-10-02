@@ -91,6 +91,10 @@ relative `isdataat`, Base64 decoding and ASN.1 offsets. A modifier separated fro
 its source pattern by SIP shorthand is also refused, including standalone `replace`.
 Snort 2 sticky payload contexts remain independent from backward content modifiers,
 including auto-detected `file_data` and the decoded Base64 buffer. Every
+one-shot backward content group restores the source payload context before any
+later non-modifier, including actual Base64 decoding and buffer-size tests.
+Cursor-relative operations that cannot cross that restoration safely are refused
+in strict, non-strict and direct rendering paths. Every
 unquoted option semicolon is a delimiter, including inside brackets or parentheses.
 Quoted content remains intact. Panorama writes no batches or completion manifest
 when any input record fails parsing.

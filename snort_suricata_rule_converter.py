@@ -1976,18 +1976,25 @@ def transform_snort2_to_snort3(options: Sequence[RuleOption]) -> list[RuleOption
             active_buffer = option.key
             payload_buffer = option.key
             continue
-        if (
-            option.key
-            in {
-                "pcre",
-                "byte_extract",
-                "byte_jump",
-                "byte_math",
-                "byte_test",
-                "isdataat",
-            }
-            and active_buffer != payload_buffer
-        ):
+        # A backward modifier belongs only to its source content group. Restore
+        # before any subsequent non-modifier instead of listing payload consumers.
+        # Cursor-relative consumers cannot be moved safely between these buffers.
+        if option.key not in DISPLACED_PATTERN_MODIFIERS and active_buffer != payload_buffer:
+            if (
+                option.key == "pcre"
+                and option.value is not None
+                and "R" in pcre_flags(option.value)
+            ) or (
+                (
+                    option.key.startswith("byte_")
+                    or option.key in {"isdataat", "base64_decode", "asn1", "bufferlen"}
+                )
+                and option.value is not None
+                and re.search(r"\brelative(?:_offset)?\b", option.value.lower()) is not None
+            ):
+                raise ConverterError(
+                    "Relative payload operation after a backward Snort 2 content modifier cannot preserve its cursor"
+                )
             transformed.append(RuleOption(payload_buffer, None, payload_buffer))
             active_buffer = payload_buffer
         transformed.append(option)
@@ -2670,7 +2677,16 @@ def convert_rules(
         if any(item.severity == "error" for item in diagnostics):
             result.rejected_rule_indexes.append(rule.index)
             continue
-        result.rules.append(render_rule(rule, target, dialect))
+        try:
+            rendered = render_rule(rule, target, dialect)
+        except ConverterError as error:
+            extend_diagnostics(
+                result.diagnostics,
+                [option_diagnostic(rule, "error", "UNSAFE_RULE_TRANSFORMATION", str(error))],
+            )
+            result.rejected_rule_indexes.append(rule.index)
+            continue
+        result.rules.append(rendered)
     if result.unverified_keywords and not strict:
         if len(result.diagnostics) >= MAX_DIAGNOSTICS:
             raise ConverterError("Diagnostic budget exceeded; no partial output is safe")

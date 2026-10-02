@@ -98,6 +98,46 @@ class ConversionBoundaries(unittest.TestCase):
         rendered = app.render_rule(parsed.rules[0], "suricata", source_dialect="snort2")
         self.assertIn('http.uri; content:"request"; file.data; content:"decoded";', rendered)
 
+    def test_snort2_one_shot_modifier_restores_before_actual_payload_operations(self):
+        for selector, expected in (("file_data;", "file.data;"), ("", "pkt_data;")):
+            for operation, rendered in (
+                (
+                    "base64_decode:bytes 8, offset 0; base64_data;",
+                    "base64_decode:bytes 8, offset 0;",
+                ),
+                ("bufferlen:10;", "bsize:10;"),
+                ("isdataat:1;", "isdataat:1;"),
+                ("byte_test:1,=,1,0;", "byte_test:1,=,1,0;"),
+            ):
+                parsed = app.RuleParser().parse_text(
+                    f'alert tcp any any -> any any ({selector}content:"request"; http_uri; {operation} sid:1001;)'
+                )
+                for strict in (True, False):
+                    result = app.convert_rules(
+                        parsed.rules, "suricata", strict=strict, source_dialect="snort2"
+                    )
+                    self.assertFalse(result.errors)
+                    self.assertIn(expected + " " + rendered, result.rules[0])
+                direct = app.render_rule(parsed.rules[0], "suricata", source_dialect="snort2")
+                self.assertIn(expected + " " + rendered, direct)
+        for operation in (
+            'pcre:"/x/R";',
+            "byte_test:1,=,1,0,relative;",
+            "base64_decode:bytes 8,relative;",
+            "isdataat:1,relative;",
+        ):
+            parsed = app.RuleParser().parse_text(
+                f'alert tcp any any -> any any (file_data; content:"request"; http_uri; {operation} sid:1001;)'
+            )
+            for strict in (True, False):
+                result = app.convert_rules(
+                    parsed.rules, "suricata", strict=strict, source_dialect="snort2"
+                )
+                self.assertEqual(result.rules, [])
+                self.assertTrue(result.errors)
+            with self.assertRaisesRegex(app.ConverterError, "cannot preserve its cursor"):
+                app.render_rule(parsed.rules[0], "suricata", source_dialect="snort2")
+
     def test_replace_is_rejected_only_when_sip_displaces_its_source_pattern(self):
         for shorthand in ("sip_method:INFO;", "sip_stat_code:200;"):
             for dialect in ("auto", "snort2", "snort3"):
