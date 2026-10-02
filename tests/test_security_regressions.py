@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import base64
+import csv
 import gzip
+import hashlib
 import io
 import os
 import tarfile
@@ -20,6 +23,85 @@ RULE = 'alert tcp any any -> any 80 (content:"test"; sid:1001;)'
 
 
 class SecurityRegressions(unittest.TestCase):
+    def test_required_review_failure_cannot_leave_a_primary_ruleset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            source, output, report, rejected = (
+                parent / name for name in ("input", "output", "report", "rejected")
+            )
+            source.write_text(
+                RULE
+                + '\nalert tcp any any -> any 80 (http_header:field user-agent; content:"ua"; sid:1002;)',
+                encoding="utf-8",
+            )
+            original = converter.atomic_write_text
+
+            def write(path, text, force=False):
+                if path == report:
+                    raise converter.ConverterError("synthetic review publication failure")
+                return original(path, text, force)
+
+            with patch.object(converter, "atomic_write_text", side_effect=write):
+                result = converter.main(
+                    [
+                        "convert",
+                        str(source),
+                        "--target",
+                        "snort2",
+                        "--source-dialect",
+                        "snort3",
+                        "--allow-partial",
+                        "--output",
+                        str(output),
+                        "--report",
+                        str(report),
+                        "--rejected-output",
+                        str(rejected),
+                    ]
+                )
+            self.assertEqual(result, converter.EXIT_OPERATIONAL_ERROR)
+            self.assertFalse(output.exists())
+
+    def test_record_traversal_and_unreviewed_metadata_semantics_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "unreviewed"):
+            verify_distribution.validate_record({"RECORD": b"../../outside,,\n"}, "RECORD")
+        import email
+
+        metadata = email.message_from_string(
+            "Metadata-Version: 2.4\nName: ids-rule-converter\nVersion: 4.0.2\n"
+            "Requires-Python: <3.15,>=3.10\nDescription-Content-Type: text/markdown\n"
+            "License-Expression: Apache-2.0\nLicense-File: LICENSE\nProvides-Extra: unreviewed\n"
+        )
+        with self.assertRaisesRegex(ValueError, "unreviewed installation semantics"):
+            verify_distribution.validate_metadata(metadata)
+
+    @unittest.skipIf(os.name == "nt", "POSIX link semantics")
+    def test_intermediate_output_parent_link_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            target = parent / "target"
+            target.mkdir()
+            (parent / "link").symlink_to(target, target_is_directory=True)
+            with self.assertRaises(converter.ConverterError):
+                converter.atomic_write_bytes(parent / "link" / "nested" / "out", b"private")
+            self.assertEqual(list(target.iterdir()), [])
+
+    @unittest.skipUnless(os.name == "nt", "Windows directory sharing semantics")
+    def test_windows_output_parent_is_locked_through_publication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory) / "reports"
+            parent.mkdir()
+            original = converter.os.link
+
+            def publish(source, destination):
+                with self.assertRaises(PermissionError):
+                    parent.rename(Path(directory) / "replaced")
+                return original(source, destination)
+
+            with patch.object(converter.os, "link", side_effect=publish):
+                converter.atomic_write_bytes(parent / "out", b"synthetic")
+            self.assertEqual((parent / "out").read_bytes(), b"synthetic")
+
     def test_unclosed_comment_rejects_entire_ruleset(self):
         parsed = converter.RuleParser().parse_text(RULE + "\n/* hidden remaining rules")
         self.assertTrue(parsed.errors)
@@ -43,6 +125,14 @@ class SecurityRegressions(unittest.TestCase):
         )
         self.assertEqual(converted.rules, [])
         self.assertTrue(converted.rejected_rule_indexes)
+        reordered = converter.RuleParser().parse_text(
+            'alert tcp any any -> any 80 (content:"packet"; http_header:field user-agent; content:"ua"; sid:1001;)'
+        )
+        for dialect in ("auto", "snort2", "snort3"):
+            converted = converter.convert_rules(
+                reordered.rules, "snort2", strict=True, source_dialect=dialect
+            )
+            self.assertEqual(converted.rules, [], dialect)
 
     @unittest.skipIf(os.name == "nt", "Windows forbids newline filenames")
     def test_filename_cannot_escape_source_comment(self):
@@ -124,28 +214,30 @@ class SecurityRegressions(unittest.TestCase):
         version = "4.0.2"
         wheel = directory / f"ids_rule_converter-{version}-py3-none-any.whl"
         sdist = directory / f"ids_rule_converter-{version}.tar.gz"
-        metadata = f"Metadata-Version: 2.4\nName: ids-rule-converter\nVersion: {version}\n".encode()
+        metadata = (
+            f"Metadata-Version: 2.4\nName: ids-rule-converter\nVersion: {version}\nRequires-Python: <3.15,>=3.10\nDescription-Content-Type: text/markdown\nLicense-Expression: Apache-2.0\nLicense-File: LICENSE\n"
+        ).encode()
         entry = b"[console_scripts]\nids-rule-converter = snort_suricata_rule_converter:main\n"
+        prefix = f"ids_rule_converter-{version}.dist-info/"
+        values = {
+            verify_distribution.MODULE: (ROOT / verify_distribution.MODULE).read_bytes(),
+            prefix + "METADATA": metadata,
+            prefix
+            + "WHEEL": b"Wheel-Version: 1.0\nGenerator: synthetic\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+            prefix + "entry_points.txt": entry,
+            prefix + "top_level.txt": b"snort_suricata_rule_converter\n",
+            prefix + "licenses/LICENSE": (ROOT / "LICENSE").read_bytes(),
+        }
+        record = io.StringIO(newline="")
+        writer = csv.writer(record)
+        for name, data in values.items():
+            digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+            writer.writerow([name, "sha256=" + digest, len(data)])
+        writer.writerow([prefix + "RECORD", "", ""])
+        values[prefix + "RECORD"] = record.getvalue().encode()
         with zipfile.ZipFile(wheel, "w") as archive:
-            archive.writestr(
-                verify_distribution.MODULE, (ROOT / verify_distribution.MODULE).read_bytes()
-            )
-            for name in (
-                "METADATA",
-                "WHEEL",
-                "RECORD",
-                "entry_points.txt",
-                "top_level.txt",
-                "licenses/LICENSE",
-            ):
-                data = (
-                    metadata
-                    if name == "METADATA"
-                    else entry
-                    if name == "entry_points.txt"
-                    else b"synthetic"
-                )
-                archive.writestr(f"ids_rule_converter-{version}.dist-info/{name}", data)
+            for name, data in values.items():
+                archive.writestr(name, data)
         reviewed = {verify_distribution.MODULE, "LICENSE", "README.md", "pyproject.toml"}
         reviewed.update(
             path.relative_to(ROOT).as_posix() for path in (ROOT / "tests").glob("test_*.py")
@@ -154,20 +246,18 @@ class SecurityRegressions(unittest.TestCase):
         members.update(
             {"PKG-INFO": metadata, "setup.cfg": b"[egg_info]\ntag_build = \ntag_date = 0\n"}
         )
-        for name in (
-            "PKG-INFO",
-            "SOURCES.txt",
-            "dependency_links.txt",
-            "entry_points.txt",
-            "top_level.txt",
-        ):
-            members[f"ids_rule_converter.egg-info/{name}"] = (
-                metadata
-                if name == "PKG-INFO"
-                else entry
-                if name == "entry_points.txt"
-                else b"synthetic"
-            )
+        generated = {
+            "PKG-INFO": metadata,
+            "dependency_links.txt": b"\n",
+            "entry_points.txt": entry,
+            "top_level.txt": b"snort_suricata_rule_converter\n",
+        }
+        for name, data in generated.items():
+            members[f"ids_rule_converter.egg-info/{name}"] = data
+        listed = (set(members) - {"PKG-INFO", "setup.cfg"}) | {
+            "ids_rule_converter.egg-info/SOURCES.txt"
+        }
+        members["ids_rule_converter.egg-info/SOURCES.txt"] = "\n".join(sorted(listed)).encode()
         with tarfile.open(sdist, "w:gz") as archive:
             for name, data in members.items():
                 info = tarfile.TarInfo(f"ids_rule_converter-{version}/{name}")

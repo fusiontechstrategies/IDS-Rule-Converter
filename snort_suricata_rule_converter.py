@@ -9,6 +9,7 @@ modifiers are not silently discarded during conversion.
 from __future__ import annotations
 
 import argparse
+import csv
 import gzip
 import hashlib
 import io
@@ -17,9 +18,9 @@ import os
 import re
 import ssl
 import stat
+import subprocess  # nosec B404
 import sys
 import tarfile
-import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -27,7 +28,7 @@ import uuid
 import zipfile
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from contextlib import suppress
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -562,9 +563,172 @@ def read_utf8(path: Path, max_bytes: int = MAX_INPUT_BYTES) -> tuple[str, int]:
         ) from exc
 
 
+@contextmanager
+def windows_report_directory_lock(path, sid=None):
+    """Hold a non-reparse directory against replacement; set its DACL by handle."""
+    if sys.platform != "win32":
+        raise OSError("Windows report directory handles are unavailable on this platform")
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    security = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    kernel.GetFileInformationByHandleEx.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    kernel.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel.LocalFree.restype = ctypes.c_void_p
+    # READ_ATTRIBUTES, optionally WRITE_DAC. Share read/write but never delete.
+    handle = kernel.CreateFileW(
+        str(path), 0x80 | (0x60000 if sid else 0), 3, None, 3, 0x02200000, None
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        attributes = (wintypes.DWORD * 2)()
+        if not kernel.GetFileInformationByHandleEx(
+            handle, 9, ctypes.byref(attributes), ctypes.sizeof(attributes)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if not attributes[0] & 0x10 or attributes[0] & 0x400:
+            raise PermissionError("Report directory must be a regular non-reparse directory")
+        if sid:
+            descriptor = ctypes.c_void_p()
+            security.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+                wintypes.LPCWSTR,
+                wintypes.DWORD,
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_void_p,
+            ]
+            security.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+            security.GetSecurityDescriptorDacl.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(wintypes.BOOL),
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.POINTER(wintypes.BOOL),
+            ]
+            security.GetSecurityDescriptorDacl.restype = wintypes.BOOL
+            security.SetSecurityInfo.argtypes = [
+                wintypes.HANDLE,
+                ctypes.c_int,
+                wintypes.DWORD,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+            ]
+            security.SetSecurityInfo.restype = wintypes.DWORD
+            if not security.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                f"D:P(A;OICI;FA;;;{sid})", 1, ctypes.byref(descriptor), None
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            try:
+                present, defaulted, dacl = wintypes.BOOL(), wintypes.BOOL(), ctypes.c_void_p()
+                if not security.GetSecurityDescriptorDacl(
+                    descriptor, ctypes.byref(present), ctypes.byref(dacl), ctypes.byref(defaulted)
+                ):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                if not present.value or not dacl.value:
+                    raise PermissionError("Missing report protection DACL")
+                error = security.SetSecurityInfo(handle, 1, 0x80000004, None, None, dacl, None)
+                if error:
+                    raise ctypes.WinError(error)
+            finally:
+                kernel.LocalFree(descriptor)
+        yield
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def windows_private_report_directory(parent, sid):
+    """Create the directory with its protected owner DACL already in place."""
+    if sys.platform != "win32":
+        raise OSError("Windows security APIs require Windows")
+    import ctypes
+    from ctypes import wintypes
+
+    class SecurityAttributes(ctypes.Structure):
+        _fields_ = [
+            ("length", wintypes.DWORD),
+            ("descriptor", ctypes.c_void_p),
+            ("inherit", wintypes.BOOL),
+        ]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    security = ctypes.WinDLL("advapi32", use_last_error=True)
+    security.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+    ]
+    security.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+    kernel.CreateDirectoryW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(SecurityAttributes)]
+    kernel.CreateDirectoryW.restype = wintypes.BOOL
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel.LocalFree.restype = ctypes.c_void_p
+    descriptor = ctypes.c_void_p()
+    if not security.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        f"D:P(A;OICI;FA;;;{sid})", 1, ctypes.byref(descriptor), None
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        attributes = SecurityAttributes(ctypes.sizeof(SecurityAttributes), descriptor, False)
+        staging = parent / (".govhawk-private-" + os.urandom(16).hex())
+        if not kernel.CreateDirectoryW(str(staging), ctypes.byref(attributes)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return staging
+    finally:
+        kernel.LocalFree(descriptor)
+
+
+def reject_parent_links(path: Path) -> None:
+    for parent in (path, *path.parents):
+        if parent.is_symlink() or (
+            parent.exists()
+            and getattr(parent.lstat(), "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        ):
+            raise ConverterError("Output parent contains a link or reparse point")
+
+
+def open_posix_directory(path: Path) -> int:
+    """Walk from the root through no-follow descriptors and pin each component."""
+    if sys.platform == "win32":
+        raise ConverterError("POSIX output handles unavailable")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open(path.anchor, flags)
+    try:
+        for part in path.parts[1:]:
+            child = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def ensure_output_path(path: Path, force: bool) -> Path:
     requested = path.expanduser().absolute()
-    resolved_parent = requested.parent.resolve()
+    resolved_parent = requested.parent
+    reject_parent_links(resolved_parent)
     resolved_parent.mkdir(parents=True, exist_ok=True)
     resolved = resolved_parent / requested.name
     if resolved.is_symlink() or (
@@ -605,7 +769,7 @@ def ensure_outputs_do_not_replace_inputs(outputs: Iterable[Path], inputs: Iterab
 def atomic_write_bytes(path: Path, data: bytes, force: bool = False) -> Path:
     destination = ensure_output_path(path, force)
     if os.name != "nt":
-        directory = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        directory = open_posix_directory(destination.parent)
         temporary_name = f".ids-{uuid.uuid4().hex}.tmp"
         try:
             info = os.fstat(directory)
@@ -649,26 +813,43 @@ def atomic_write_bytes(path: Path, data: bytes, force: bool = False) -> Path:
                 os.unlink(temporary_name, dir_fd=directory)
             os.close(directory)
         return destination
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        if force:
-            os.replace(temporary, destination)
-        else:
-            try:
-                os.link(temporary, destination)
-            except FileExistsError as exc:
-                raise ConverterError(f"Output already exists: {destination}") from exc
-            temporary.unlink()
-    except Exception:
-        temporary.unlink(missing_ok=True)
-        raise
+    with ExitStack() as locks:
+        for parent in reversed((destination.parent, *destination.parent.parents)):
+            locks.enter_context(windows_report_directory_lock(parent))
+        identity = subprocess.run(  # noqa: S603 # nosec B603
+            [
+                str(Path(os.environ["SYSTEMROOT"]) / "System32" / "whoami.exe"),
+                "/user",
+                "/fo",
+                "csv",
+                "/nh",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        sid = next(csv.reader([identity.stdout.strip()]))[1]
+        if not re.fullmatch(r"S-1-[0-9-]+", sid):
+            raise ConverterError("Cannot resolve current user SID")
+        staging = windows_private_report_directory(destination.parent, sid)
+        try:
+            with windows_report_directory_lock(staging, sid):
+                temporary = staging / "report"
+                with temporary.open("xb") as handle:
+                    handle.write(data)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                if force:
+                    os.replace(temporary, destination)
+                else:
+                    try:
+                        os.link(temporary, destination)
+                    except FileExistsError as exc:
+                        raise ConverterError(f"Output already exists: {destination}") from exc
+                temporary.unlink(missing_ok=True)
+        finally:
+            (staging / "report").unlink(missing_ok=True)
+            staging.rmdir()
     return destination
 
 
@@ -1856,7 +2037,10 @@ def compatibility_diagnostics(
             )
         elif key not in COMMON_OPTIONS and target != source_dialect:
             unverified[key] += 1
-    if target == "snort2" and source_dialect in {"snort3", "suricata"}:
+    if target == "snort2" and (
+        source_dialect in {"snort3", "suricata"}
+        or any(option.value and option.key in LEGACY_TO_DOTTED_BUFFER for option in rule.options)
+    ):
         active_buffer: str | None = None
         payload_noncontent = {
             "byte_extract",
@@ -1869,7 +2053,8 @@ def compatibility_diagnostics(
         for option in rule.options:
             key = option.key
             if key in DOTTED_TO_LEGACY_BUFFER or (
-                source_dialect == "snort3" and key in LEGACY_TO_DOTTED_BUFFER
+                (source_dialect == "snort3" or option.value is not None)
+                and key in LEGACY_TO_DOTTED_BUFFER
             ):
                 active_buffer = DOTTED_TO_LEGACY_BUFFER.get(key, key)
                 if option.value is not None:
@@ -2806,8 +2991,9 @@ def extract_archive(data: bytes, archive_type: str, output_dir: Path, force: boo
         & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     ):
         raise ConverterError("Extraction root cannot be a link or reparse point")
-    output_dir = output_dir.expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = output_dir.expanduser().absolute()
+    reject_parent_links(output_dir)
+    output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     written: list[Path] = []
 
     def destination_for(name: str) -> Path:
@@ -3103,7 +3289,6 @@ def command_convert(args: argparse.Namespace) -> int:
             + "\n"
         )
     ensure_outputs_available(requested_outputs, args.force)
-    atomic_write_text(args.output, "\n".join(output_lines), force=args.force)
     if args.rejected_output and converted.rejected_rule_indexes:
         atomic_write_text(args.rejected_output, rejected_text, force=args.force)
     if args.report:
@@ -3123,6 +3308,7 @@ def command_convert(args: argparse.Namespace) -> int:
             "diagnostics": [item.to_dict() for item in all_diagnostics],
         }
         atomic_write_text(args.report, json_text(report), force=args.force)
+    atomic_write_text(args.output, "\n".join(output_lines), force=args.force)
     print(f"Converted {len(converted.rules):,} rules to {args.target}: {args.output}")
     print_diagnostics(all_diagnostics)
     return EXIT_FINDINGS if converted.rejected_rule_indexes else EXIT_OK
