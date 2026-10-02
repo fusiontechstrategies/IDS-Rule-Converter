@@ -17,6 +17,7 @@ concurrency:
 
 jobs:
   verify:
+    if: github.ref == 'refs/heads/main'
     name: Verify public release distributions
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -29,6 +30,7 @@ jobs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
       source-commit: ${{ steps.identity.outputs.source-commit }}
       release-id: ${{ steps.identity.outputs.release-id }}
+      verifier-commit: ${{ steps.verifier.outputs.commit }}
     steps:
       - name: Check out tagged source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -37,10 +39,22 @@ jobs:
           persist-credentials: false
           ref: ${{ inputs.tag }}
 
+      - name: Resolve protected main verification code
+        id: verifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/main
+          test "$(gh api "repos/$GH_REPO/branches/main" --jq '.protected')" = true
+          commit="$(gh api "repos/$GH_REPO/branches/main" --jq '.commit.sha')"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          test "$(gh api "repos/$GH_REPO/commits/$commit" --jq '.commit.verification.verified')" = true
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
       - name: Check out workflow-reviewed verification code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ steps.verifier.outputs.commit }}
           persist-credentials: false
           path: trusted-verifier
 
@@ -156,6 +170,25 @@ jobs:
           artifact-ids: ${{ needs.verify.outputs.artifact-id }}
           merge-multiple: true
           path: dist
+
+      - name: Check out protected verification revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.verify.outputs.verifier-commit }}
+          path: trusted-verifier
+          persist-credentials: false
+
+      - name: Check out verified release source as data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.verify.outputs.source-commit }}
+          path: release-source
+          persist-credentials: false
+
+      - name: Revalidate distributions with protected verification code
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: python -I trusted-verifier/scripts/verify_distribution.py dist --source-root release-source --version "${RELEASE_TAG#v}"
 
       - name: Reverify immutable transfer without running tagged code
         env:

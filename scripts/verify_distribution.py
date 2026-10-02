@@ -6,12 +6,15 @@ import argparse
 import base64
 import csv
 import email
+import gzip
 import hashlib
 import io
+import struct
 import tarfile
 import unicodedata
 import zipfile
 from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
 MODULE = "snort_suricata_rule_converter.py"
@@ -19,6 +22,132 @@ BLOCKED_SUFFIXES = {".env", ".key", ".p12", ".pem", ".pfx", ".pyc"}
 WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL"} | {
     f"{prefix}{index}" for prefix in ("COM", "LPT") for index in range(1, 10)
 }
+
+
+MAX_ARCHIVE_BYTES = 8 * 1024 * 1024
+MAX_MEMBER_BYTES = 1024 * 1024
+MAX_EXPANDED_BYTES = 8 * 1024 * 1024
+MAX_ARCHIVE_MEMBERS = 256
+
+
+class LimitedExpandedReader:
+    """Bound the whole gzip stream, including invisible TAR/PAX headers."""
+
+    def __init__(self, stream, compressed_bytes):
+        self.stream = stream
+        self.remaining = min(MAX_EXPANDED_BYTES, max(64 * 1024, 512 * compressed_bytes))
+
+    def read(self, size=-1):
+        request = self.remaining + 1 if size < 0 else min(size, self.remaining + 1)
+        value = self.stream.read(request)
+        if len(value) > self.remaining:
+            raise ValueError("Archive expanded-byte budget exceeded")
+        self.remaining -= len(value)
+        return value
+
+
+class CachedArchive:
+    def __init__(self, members, values):
+        self.members, self.values = members, values
+
+    def namelist(self):
+        return [member.filename for member in self.members]
+
+    def getmembers(self):
+        return self.members
+
+    def read(self, name):
+        return self.values[name]
+
+    def extractfile(self, name):
+        return io.BytesIO(self.values[name]) if name in self.values else None
+
+
+def validate_archive_file(path):
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_ARCHIVE_BYTES:
+        raise ValueError("Archive file type or compressed-byte budget invalid")
+
+
+@contextmanager
+def bounded_wheel(path):
+    validate_archive_file(path)
+    # Reject inflated central-directory metadata before ZipFile materializes it.
+    with path.open("rb") as stream:
+        # Include the 20-byte ZIP64 locator even with the maximum EOCD comment.
+        stream.seek(max(0, path.stat().st_size - (65557 + 20)))
+        tail = stream.read(65557 + 20)
+    start = tail.rfind(b"PK\x05\x06")
+    if start < 0 or len(tail) - start < 22:
+        raise ValueError("Missing ZIP end record")
+    # ZipFile honors this locator even when the legacy end record advertises zero.
+    # These small release wheels never require ZIP64 metadata.
+    if start >= 20 and tail[start - 20 : start - 16] == b"PK\x06\x07":
+        raise ValueError("ZIP64 archives are unsupported")
+    _, disk, cd_disk, disk_count, count, cd_bytes, _, comment = struct.unpack(
+        "<4s4H2LH", tail[start : start + 22]
+    )
+    if (
+        disk
+        or cd_disk
+        or disk_count != count
+        or count > MAX_ARCHIVE_MEMBERS
+        or cd_bytes > 256 * 1024
+        or start + 22 + comment != len(tail)
+    ):
+        raise ValueError("ZIP metadata budget exceeded or unsupported archive")
+    with zipfile.ZipFile(path) as archive:
+        members = archive.infolist()
+        if (
+            len(members) > MAX_ARCHIVE_MEMBERS
+            or sum(member.file_size for member in members) > MAX_EXPANDED_BYTES
+        ):
+            raise ValueError("ZIP member or expanded-byte budget exceeded")
+        values = {}
+        for member in members:
+            if (
+                member.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
+                or member.file_size > MAX_MEMBER_BYTES
+                or member.file_size > 512 * max(1, member.compress_size)
+            ):
+                raise ValueError("ZIP member decoder, size or compression ratio invalid")
+            with archive.open(member) as stream:
+                data = stream.read(MAX_MEMBER_BYTES + 1)
+            if len(data) > MAX_MEMBER_BYTES or len(data) != member.file_size:
+                raise ValueError("ZIP member exceeded its expanded-byte budget")
+            values[member.filename] = data
+        yield CachedArchive(members, values)
+
+
+@contextmanager
+def bounded_sdist(path):
+    validate_archive_file(path)
+    members, values = [], {}
+    total = 0
+    with path.open("rb") as raw, gzip.GzipFile(fileobj=raw) as expanded:
+        limited = LimitedExpandedReader(expanded, path.stat().st_size)
+        with tarfile.open(fileobj=limited, mode="r|") as archive:
+            for member in archive:
+                members.append(member)
+                if (
+                    len(members) > MAX_ARCHIVE_MEMBERS
+                    or member.size > MAX_MEMBER_BYTES
+                    or member.size < 0
+                    or not (member.isfile() or member.isdir())
+                ):
+                    raise ValueError("TAR member count, size or type invalid")
+                total += member.size
+                if total > MAX_EXPANDED_BYTES:
+                    raise ValueError("TAR aggregate expanded-byte budget exceeded")
+                if member.isfile():
+                    stream = archive.extractfile(member)
+                    if stream is None:
+                        raise ValueError("TAR file contents unavailable")
+                    with stream:
+                        data = stream.read(MAX_MEMBER_BYTES + 1)
+                    if len(data) > MAX_MEMBER_BYTES or len(data) != member.size:
+                        raise ValueError("TAR member exceeded its expanded-byte budget")
+                    values[member.name] = data
+    yield CachedArchive(members, values)
 
 
 def validate_record(values: dict[str, bytes], record: str) -> None:
@@ -147,7 +276,7 @@ def verify_distribution(dist_dir: Path, source_root: Path, version: str) -> tupl
     if {path.name for path in dist_dir.iterdir()} != {wheel_name, sdist_name}:
         raise ValueError("Distribution directory must contain the exact wheel and source archive")
     wheel, sdist = dist_dir / wheel_name, dist_dir / sdist_name
-    with zipfile.ZipFile(wheel) as archive:
+    with bounded_wheel(wheel) as archive:
         names = archive.namelist()
         safe_names(names)
         prefix = f"ids_rule_converter-{version}.dist-info/"
@@ -210,7 +339,7 @@ def verify_distribution(dist_dir: Path, source_root: Path, version: str) -> tupl
             != "[console_scripts]\nids-rule-converter = snort_suricata_rule_converter:main"
         ):
             raise ValueError("Wheel CLI entry point differs from release")
-    with tarfile.open(sdist, mode="r:gz") as archive:
+    with bounded_sdist(sdist) as archive:
         members = archive.getmembers()
         safe_names([member.name for member in members])
         if any(not (member.isfile() or member.isdir()) for member in members):
