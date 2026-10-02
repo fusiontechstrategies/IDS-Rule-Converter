@@ -2138,6 +2138,25 @@ def mapped_suricata_stream_size(value: str) -> str | None:
     return f"{directions[snort_direction.lower() if snort_direction else None]},{suricata_operator},{number}"
 
 
+def mapped_suricata_bufferlen(value: str | None) -> str | None:
+    if value is None:
+        return None
+    # Accept the documented shared absolute numeric grammar only. This also
+    # rejects relative qualifiers regardless of tabs, newlines or other spacing.
+    match = re.fullmatch(r"\s*(<=|>=|[<>=])?\s*([0-9]+)\s*(?:<>\s*([0-9]+)\s*)?", value)
+    if match is None:
+        return None
+    operator, first, second = match.groups()
+    numbers = [number.lstrip("0") or "0" for number in (first, second) if number is not None]
+    if any(len(number) > 5 or int(number) > 65535 for number in numbers):
+        return None
+    if second is not None:
+        if operator is not None or int(numbers[0]) >= int(numbers[1]):
+            return None
+        return f"{int(numbers[0])}<>{int(numbers[1])}"
+    return (operator or "") + str(int(numbers[0]))
+
+
 def sip_relative_cursor_unsafe(options: Sequence[RuleOption]) -> bool:
     if not any(option.key in SNORT_TO_SURICATA_OPTION for option in options):
         return False
@@ -2198,15 +2217,10 @@ def transform_to_suricata(
                     RuleOption("app-layer-protocol", service, option.raw, option.origin)
                 )
         elif key == "bufferlen":
-            value = option.value or ""
-            if (
-                not value
-                or ",relative" in value.replace(" ", "").lower()
-                or "<=>" in value
-                or value.lstrip().startswith("!")
-            ):
+            value = mapped_suricata_bufferlen(option.value)
+            if value is None:
                 raise ConverterError("bufferlen cannot safely map to Suricata bsize")
-            transformed.append(RuleOption("bsize", option.value, option.raw, option.origin))
+            transformed.append(RuleOption("bsize", value, option.raw, option.origin))
         elif key == "tag" and option.value is not None:
             value = mapped_suricata_tag(option.value)
             if value is not None:
@@ -2471,19 +2485,13 @@ def compatibility_diagnostics(
                 )
             )
         elif target == "suricata" and key == "bufferlen":
-            value = option.value or ""
-            if (
-                not value
-                or ",relative" in value.replace(" ", "").lower()
-                or "<=>" in value
-                or value.lstrip().startswith("!")
-            ):
+            if mapped_suricata_bufferlen(option.value) is None:
                 diagnostics.append(
                     option_diagnostic(
                         rule,
                         "error",
                         "UNSAFE_BUFFERLEN_MAPPING",
-                        "bufferlen can map to Suricata bsize only without relative, inclusive-range, or negated semantics",
+                        "bufferlen can map to Suricata bsize only for absolute 0..65535 comparisons or ascending exclusive ranges",
                         option.name,
                     )
                 )

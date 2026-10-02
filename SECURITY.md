@@ -99,7 +99,12 @@ pattern cursor. Relative consumers and relative content are refused until a real
 positive content match or explicit source buffer selection establishes a safe
 cursor; a negative match does not establish one. All refusals apply in strict,
 non-strict and direct rendering paths. Direct rendering also refuses unsupported
-relative, negated, empty or inclusive-range bufferlen mappings to bsize. Every
+relative, negated, empty or inclusive-range bufferlen mappings to bsize. Public
+and direct paths share one bounded numeric mapping: absolute values from 0 to
+65535, supported comparisons and ascending exclusive ranges. Tabs and newlines
+cannot hide a relative qualifier. This follows the [Snort bufferlen grammar](https://docs.snort.org/rules/options/payload/bufferlen)
+and [Suricata bsize grammar](https://docs.suricata.io/en/suricata-8.0.7/rules/payload-keywords.html#bsize).
+Every
 unquoted option semicolon is a delimiter, including inside brackets or parentheses.
 Quoted content remains intact. Panorama writes no batches or completion manifest
 when any input record fails parsing.

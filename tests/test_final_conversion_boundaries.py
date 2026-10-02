@@ -224,6 +224,13 @@ class ConversionBoundaries(unittest.TestCase):
             "bufferlen:!10;",
             "bufferlen:1<=>10;",
             "bufferlen:10,relative;",
+            "bufferlen:10,\trelative;",
+            "bufferlen:10,\nrelative;",
+            "bufferlen:10,\r\n \tReLaTiVe;",
+            "bufferlen:65536;",
+            "bufferlen:10<>1;",
+            "bufferlen:10<>10;",
+            "bufferlen:bogus;",
         ):
             parsed = app.RuleParser().parse_text(
                 f'alert tcp any any -> any any (content:"anchor"; {option} sid:1001;)'
@@ -232,10 +239,27 @@ class ConversionBoundaries(unittest.TestCase):
                 self.assertTrue(app.convert_rules(parsed.rules, "suricata", strict=strict).errors)
             with self.assertRaisesRegex(app.ConverterError, "bufferlen cannot safely map"):
                 app.render_rule(parsed.rules[0], "suricata")
-        parsed = app.RuleParser().parse_text(
-            'alert tcp any any -> any any (content:"anchor"; bufferlen:10; sid:1001;)'
-        )
-        self.assertIn("bsize:10;", app.render_rule(parsed.rules[0], "suricata"))
+        for value, expected in (
+            ("10", "10"),
+            ("=10", "=10"),
+            ("<10", "<10"),
+            (">10", ">10"),
+            ("<=10", "<=10"),
+            (">=10", ">=10"),
+            ("1<>10", "1<>10"),
+            ("0", "0"),
+            ("65535", "65535"),
+            ("1\t<>\n10", "1<>10"),
+            ("\t<= \n00010", "<=10"),
+        ):
+            parsed = app.RuleParser().parse_text(
+                f'alert tcp any any -> any any (content:"anchor"; bufferlen:{value}; sid:1001;)'
+            )
+            for strict in (True, False):
+                result = app.convert_rules(parsed.rules, "suricata", strict=strict)
+                self.assertFalse(result.errors, value)
+                self.assertIn("bsize:" + expected + ";", result.rules[0])
+            self.assertIn("bsize:" + expected + ";", app.render_rule(parsed.rules[0], "suricata"))
 
     def test_replace_is_rejected_only_when_sip_displaces_its_source_pattern(self):
         for shorthand in ("sip_method:INFO;", "sip_stat_code:200;"):
