@@ -30,7 +30,7 @@ PACKAGE_FILES = (
     "SECURITY.md",
     "SUPPORT.md",
     "docs/TESTING.md",
-    RUNTIME_SOURCE,
+    "snort_suricata_rule_converter.py",
 )
 
 

@@ -102,7 +102,19 @@ def main():
         files = ast.literal_eval(declarations[0].value)
         if not isinstance(files, tuple) or not all(isinstance(name, str) for name in files):
             raise ValueError("Source manifest must be a static tuple of paths")
-        verify_source(root, args.commit, files)
+        verify_source(
+            root,
+            args.commit,
+            (
+                *files,
+                ".github/workflows/release.yml",
+                "pyproject.toml",
+                "requirements-build-lock.txt",
+                "scripts/verify_distribution.py",
+                "scripts/normalize_wheel.py",
+                "scripts/normalize_sdist.py",
+            ),
+        )
     elif args.operation == "assets":
         if args.expected == "-":
             print(json.dumps(manifest(args.directory), sort_keys=True, separators=(",", ":")))
