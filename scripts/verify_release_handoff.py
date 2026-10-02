@@ -62,6 +62,21 @@ def verify_handoff(assets, source, commit, epoch):
         rebuilt = root / "rebuilt"
         distribution = load_trusted_helper("verify_distribution")
         distribution.verify_distribution(dist, source, version)
+        # Validate bounded logical contents first. Then rebuild the exact canonical
+        # container bytes with trusted sibling helpers before accepting producer bytes.
+        wheel_normalizer = load_trusted_helper("normalize_wheel")
+        sdist_normalizer = load_trusted_helper("normalize_sdist")
+        for name, normalizer in (
+            (f"ids_rule_converter-{version}-py3-none-any.whl", wheel_normalizer.normalize_wheel),
+            (f"ids_rule_converter-{version}.tar.gz", sdist_normalizer.normalize_sdist),
+        ):
+            path = dist / name
+            original = path.read_bytes()
+            normalizer(path, epoch)
+            if path.read_bytes() != original:
+                raise ValueError(
+                    "Producer distribution bytes are not canonical for the authenticated epoch"
+                )
         prepare.prepare_release(source, rebuilt, version, commit, dist)
         manifest = integrity.manifest(rebuilt)
         integrity.verify_assets(assets, manifest)

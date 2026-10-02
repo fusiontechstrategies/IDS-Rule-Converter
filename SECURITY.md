@@ -83,3 +83,25 @@ helpers are data and never run in attestation/write jobs. Each privileged job
 requires the main-only release environment and repeats subject verification.
 The required reviewer can be explicitly bypassed by an authorized administrator,
 which remains part of the repository's trusted operator boundary.
+
+SIP shorthand conversion restores the previous payload buffer after the generated
+SIP match. Rules combining these shorthands with relative payload cursors are
+refused because switching buffers cannot safely preserve that cursor. Every
+unquoted option semicolon is a delimiter, including inside brackets or parentheses.
+Quoted content remains intact. Panorama writes no batches or completion manifest
+when any input record fails parsing.
+
+File parsing checks the actual opened descriptor against the named file, requires
+a regular bounded stable snapshot, and retains its path and device/inode identity
+for provenance and output protection. Output commands never resolve the original
+input alias again. They reject hardlink, case and Unicode-normalization aliases and
+recheck input identity immediately before forced replacement in a trusted output
+directory. Case/Unicode spelling checks are deliberately conservative even on a
+case-sensitive filesystem. Concurrent mutation by the same trusted user is outside
+the output-directory isolation guarantee; detected changes fail closed.
+
+Protected promotion validates bounded distribution contents, then rebuilds wheel
+and sdist containers with exact trusted sibling normalizers at the authenticated
+source epoch. Original producer bytes must equal those canonical bytes, including
+archive ordering, timestamps, modes, owners, comments, PAX data and gzip framing.
+Recomputing producer checksums or evidence cannot authorize noncanonical metadata.
