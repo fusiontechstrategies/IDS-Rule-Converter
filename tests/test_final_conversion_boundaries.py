@@ -64,6 +64,69 @@ class ConversionBoundaries(unittest.TestCase):
             with self.assertRaisesRegex(app.ConverterError, "relative payload cursor"):
                 app.render_rule(parsed.rules[0], "suricata", source_dialect="snort3")
 
+    def test_snort2_sticky_payload_context_survives_sip_and_legacy_modifiers(self):
+        for selector, expected in (
+            ("file_data;", "file.data;"),
+            ("base64_decode; base64_data;", "base64_data;"),
+        ):
+            for shorthand in ("sip_method:INVITE;", "sip_stat_code:200;"):
+                parsed = app.RuleParser().parse_text(
+                    f'alert tcp any any -> any any ({selector}{shorthand}content:"marker"; sid:1001;)'
+                )
+                for dialect in ("auto", "snort2", "snort3"):
+                    for strict in (True, False):
+                        with self.subTest(
+                            selector=selector, shorthand=shorthand, dialect=dialect, strict=strict
+                        ):
+                            result = app.convert_rules(
+                                parsed.rules, "suricata", strict=strict, source_dialect=dialect
+                            )
+                            self.assertFalse(result.errors)
+                            self.assertIn(expected + ' content:"marker";', result.rules[0])
+                            self.assertNotIn(
+                                expected + ' pkt_data; content:"marker";', result.rules[0]
+                            )
+                    rendered = app.render_rule(
+                        parsed.rules[0],
+                        "suricata",
+                        source_dialect=None if dialect == "auto" else dialect,
+                    )
+                    self.assertIn(expected + ' content:"marker";', rendered)
+        parsed = app.RuleParser().parse_text(
+            'alert tcp any any -> any any (file_data; content:"request"; http_uri; content:"decoded"; sid:1001;)'
+        )
+        rendered = app.render_rule(parsed.rules[0], "suricata", source_dialect="snort2")
+        self.assertIn('http.uri; content:"request"; file.data; content:"decoded";', rendered)
+
+    def test_replace_is_rejected_only_when_sip_displaces_its_source_pattern(self):
+        for shorthand in ("sip_method:INFO;", "sip_stat_code:200;"):
+            for dialect in ("auto", "snort2", "snort3"):
+                parsed = app.RuleParser().parse_text(
+                    f'alert tcp any any -> any any (content:"ABCD"; {shorthand} replace:"EFGH"; sid:1001;)'
+                )
+                for strict in (True, False):
+                    result = app.convert_rules(
+                        parsed.rules, "suricata", strict=strict, source_dialect=dialect
+                    )
+                    self.assertEqual(result.rules, [])
+                    self.assertIn("SIP_RELATIVE_CURSOR_UNSAFE", {d.code for d in result.errors})
+                with self.assertRaisesRegex(app.ConverterError, "displaced pattern modifier"):
+                    app.render_rule(
+                        parsed.rules[0],
+                        "suricata",
+                        source_dialect=None if dialect == "auto" else dialect,
+                    )
+                for body in (
+                    f'content:"ABCD"; replace:"EFGH"; {shorthand}',
+                    f'{shorthand} content:"ABCD"; replace:"EFGH";',
+                ):
+                    valid = app.RuleParser().parse_text(
+                        f"alert tcp any any -> any any ({body} sid:1001;)"
+                    )
+                    result = app.convert_rules(valid.rules, "suricata", source_dialect=dialect)
+                    self.assertFalse(result.errors)
+                    self.assertIn('content:"ABCD"; replace:"EFGH";', result.rules[0])
+
     def test_nested_semicolons_cannot_hide_options_but_quoted_payload_remains_intact(self):
         for hidden in (
             "metadata:[ok; flow:to_server; noalert]",

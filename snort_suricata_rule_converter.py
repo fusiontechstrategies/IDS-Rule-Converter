@@ -176,6 +176,10 @@ CONTENT_MODIFIERS = {
     "within",
 }
 
+# This set is separate from inline content grammar: replace is a standalone
+# post-match option, but generated SIP content can displace its source pattern.
+DISPLACED_PATTERN_MODIFIERS = CONTENT_MODIFIERS | {"replace"}
+
 LEGACY_TO_DOTTED_BUFFER = {
     "dns_query": "dns.query",
     "file_data": "file.data",
@@ -1955,31 +1959,37 @@ def transform_snort2_to_snort3(options: Sequence[RuleOption]) -> list[RuleOption
     associated_buffers = set(associations.values())
     transformed: list[RuleOption] = []
     active_buffer = "pkt_data"
+    payload_buffer = "pkt_data"
     for index, option in enumerate(options):
         if index in associated_buffers:
             continue
         if option.key == "content":
             buffer_index = associations.get(index)
-            desired = options[buffer_index].key if buffer_index is not None else "pkt_data"
+            desired = options[buffer_index].key if buffer_index is not None else payload_buffer
             if desired != active_buffer:
                 transformed.append(RuleOption(desired, None, desired))
                 active_buffer = desired
             transformed.append(option)
             continue
-        if option.key in {"file_data", "pkt_data", "raw_data"}:
+        if option.key in {"file_data", "pkt_data", "raw_data", "base64_data"}:
             transformed.append(option)
             active_buffer = option.key
+            payload_buffer = option.key
             continue
-        if option.key in {
-            "pcre",
-            "byte_extract",
-            "byte_jump",
-            "byte_math",
-            "byte_test",
-            "isdataat",
-        } and active_buffer not in {"pkt_data", "raw_data", "file_data"}:
-            transformed.append(RuleOption("pkt_data", None, "pkt_data"))
-            active_buffer = "pkt_data"
+        if (
+            option.key
+            in {
+                "pcre",
+                "byte_extract",
+                "byte_jump",
+                "byte_math",
+                "byte_test",
+                "isdataat",
+            }
+            and active_buffer != payload_buffer
+        ):
+            transformed.append(RuleOption(payload_buffer, None, payload_buffer))
+            active_buffer = payload_buffer
         transformed.append(option)
     return transformed
 
@@ -2111,7 +2121,7 @@ def sip_relative_cursor_unsafe(options: Sequence[RuleOption]) -> bool:
             shorthand_since_pattern = True
         elif option.key in {"content", "pcre"}:
             shorthand_since_pattern = False
-        elif shorthand_since_pattern and option.key in CONTENT_MODIFIERS:
+        elif shorthand_since_pattern and option.key in DISPLACED_PATTERN_MODIFIERS:
             return True
     return False
 
