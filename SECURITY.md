@@ -75,3 +75,11 @@ POSIX output paths reject unsafe, non-sticky writable ancestors as well as unsaf
 Panorama runs refuse a reused directory with recognized artifacts outside the new generation, including old higher-numbered batches or a stale rejected-rules file. Choose a fresh output directory. The manifest is published last and binds every current report and rules batch with SHA-256; consumers must verify that manifest before using a generation.
 
 Distribution verification limits compressed bytes, expanded bytes, member sizes, counts and metadata before materialization. ZIP64 wheels are refused, including locators preceding maximum-length end-record comments. PyPI publication uses a captured, signed protected-main verification revision and requires the protected-main deployment environment. Tag race closure additionally depends on the active GitHub rule preventing updates and deletion of version tags without bypass actors. Sequential API checks alone are not an atomic authorization boundary.
+
+Tag release builds are read-only. A default-branch promotion workflow authenticates
+the producer run and immutable artifact ID, then independently verifies package
+contents and reconstructs all seven subjects with protected-main helpers. Tagged
+helpers are data and never run in attestation/write jobs. Each privileged job
+requires the main-only release environment and repeats subject verification.
+The required reviewer can be explicitly bypassed by an authorized administrator,
+which remains part of the repository's trusted operator boundary.
