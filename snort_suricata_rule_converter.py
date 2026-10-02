@@ -564,10 +564,12 @@ def read_utf8(path: Path, max_bytes: int = MAX_INPUT_BYTES) -> tuple[str, int]:
 
 
 @contextmanager
-def windows_report_directory_lock(path, sid=None):
+def windows_report_directory_lock(path, sid=None, remove_on_exit=False):
     """Hold a non-reparse directory against replacement; set its DACL by handle."""
     if sys.platform != "win32":
         raise OSError("Windows report directory handles are unavailable on this platform")
+    if remove_on_exit and not sid:
+        raise ValueError("Private directory removal requires a verified owner")
     import ctypes.wintypes
 
     wintypes = ctypes.wintypes
@@ -595,12 +597,19 @@ def windows_report_directory_lock(path, sid=None):
     kernel.GetFileInformationByHandleEx.restype = wintypes.BOOL
     kernel.LocalFree.argtypes = [ctypes.c_void_p]
     kernel.LocalFree.restype = ctypes.c_void_p
-    # READ_ATTRIBUTES, optionally WRITE_DAC. Share read/write but never delete.
+    # READ_ATTRIBUTES, optionally READ_CONTROL/WRITE_DAC/DELETE. Never share delete.
     handle = kernel.CreateFileW(
-        str(path), 0x80 | (0x60000 if sid else 0), 3, None, 3, 0x02200000, None
+        str(path),
+        0x80 | (0x60000 if sid else 0) | (0x10000 if remove_on_exit else 0),
+        3,
+        None,
+        3,
+        0x02200000,
+        None,
     )
     if handle == ctypes.c_void_p(-1).value:
         raise ctypes.WinError(ctypes.get_last_error())
+    protected = False
     try:
         attributes = (wintypes.DWORD * 2)()
         if not kernel.GetFileInformationByHandleEx(
@@ -686,9 +695,27 @@ def windows_report_directory_lock(path, sid=None):
                     raise ctypes.WinError(error)
             finally:
                 kernel.LocalFree(descriptor)
+        protected = True
         yield
     finally:
-        kernel.CloseHandle(handle)
+        try:
+            if remove_on_exit and protected:
+                # The file cleanup runs while this handle and every ancestor are
+                # still pinned. Delete this exact empty directory by handle.
+                kernel.SetFileInformationByHandle.argtypes = [
+                    wintypes.HANDLE,
+                    ctypes.c_int,
+                    ctypes.c_void_p,
+                    wintypes.DWORD,
+                ]
+                kernel.SetFileInformationByHandle.restype = wintypes.BOOL
+                disposition = wintypes.BOOL(True)
+                if not kernel.SetFileInformationByHandle(
+                    handle, 4, ctypes.byref(disposition), ctypes.sizeof(disposition)
+                ):
+                    raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            kernel.CloseHandle(handle)
 
 
 def windows_private_report_directory(parent, sid):
@@ -880,9 +907,9 @@ def atomic_write_bytes(path: Path, data: bytes, force: bool = False) -> Path:
         if not re.fullmatch(r"S-1-[0-9-]+", sid):
             raise ConverterError("Cannot resolve current user SID")
         staging = windows_private_report_directory(destination.parent, sid)
-        try:
-            with windows_report_directory_lock(staging, sid):
-                temporary = staging / "report"
+        with windows_report_directory_lock(staging, sid, remove_on_exit=True):
+            temporary = staging / "report"
+            try:
                 with temporary.open("xb") as handle:
                     handle.write(data)
                     handle.flush()
@@ -894,10 +921,8 @@ def atomic_write_bytes(path: Path, data: bytes, force: bool = False) -> Path:
                         os.link(temporary, destination)
                     except FileExistsError as exc:
                         raise ConverterError(f"Output already exists: {destination}") from exc
+            finally:
                 temporary.unlink(missing_ok=True)
-        finally:
-            (staging / "report").unlink(missing_ok=True)
-            staging.rmdir()
     return destination
 
 
