@@ -2,139 +2,170 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*.*.*"
+    tags: ["v*.*.*"]
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  draft:
-    name: Build and draft release
+  build:
+    name: Build without promotion permissions
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      commit: ${{ steps.identity.outputs.commit }}
+      version: ${{ steps.identity.outputs.version }}
+      manifest: ${{ steps.final.outputs.manifest }}
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
-      - name: Check out tagged source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
           persist-credentials: false
-
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: "3.12"
-
-      - name: Install pinned distribution build tools
-        run: python -m pip install --disable-pip-version-check -r requirements-build.txt
-
-      - name: Resolve and validate release identity
+      - name: Validate signed source identity before installing tools
         id: identity
-        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Tag must contain a stable semantic version" >&2
-            exit 1
-          fi
-          release_commit="$(git rev-list --max-count=1 "$GITHUB_REF_NAME")"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          commit="$(git rev-list --max-count=1 "$GITHUB_REF_NAME")"
+          test "$commit" = "$GITHUB_SHA"
+          python -I scripts/verify_release_integrity.py source "$commit"
           git fetch --no-tags origin main
-          git merge-base --is-ancestor "$release_commit" origin/main
-          verified="$(gh api "repos/$GITHUB_REPOSITORY/commits/$release_commit" --jq '.commit.verification.verified')"
-          test "$verified" = "true"
+          git merge-base --is-ancestor "$commit" origin/main
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$commit" --jq '.commit.verification.verified')" = true
           test -f ".github/release-notes/$GITHUB_REF_NAME.md"
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "A release already exists for $GITHUB_REF_NAME" >&2
-            exit 1
-          fi
+          ! gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "commit=$release_commit" >> "$GITHUB_OUTPUT"
-
-      - name: Build exact release assets
-        shell: bash
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - name: Install complete hash-locked build dependencies
+        run: |
+          python -I -m pip install --only-binary=:all: --require-hashes -r requirements-build-lock.txt
+      - name: Build and verify the candidate
         env:
           RELEASE_VERSION: ${{ steps.identity.outputs.version }}
           RELEASE_COMMIT: ${{ steps.identity.outputs.commit }}
+        shell: bash
         run: |
           set -euo pipefail
+          git diff --exit-code "$RELEASE_COMMIT" -- .
           export SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$RELEASE_COMMIT")"
-          python -m build --no-isolation --wheel --sdist --outdir package-dist
-          python scripts/normalize_wheel.py --source-date-epoch "$SOURCE_DATE_EPOCH" package-dist/*.whl
-          python scripts/normalize_sdist.py --source-date-epoch "$SOURCE_DATE_EPOCH" package-dist/*.tar.gz
-          python scripts/verify_distribution.py package-dist --version "$RELEASE_VERSION"
-          python -m twine check package-dist/*
-          python scripts/prepare_release.py \
-            --version "$RELEASE_VERSION" \
-            --source-commit "$RELEASE_COMMIT" \
-            --dist-dir package-dist \
-            --output-dir dist
-          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 7
+          python -I -m build --no-isolation --wheel --sdist --outdir package-dist
+          python -I scripts/normalize_wheel.py --source-date-epoch "$SOURCE_DATE_EPOCH" package-dist/*.whl
+          python -I scripts/normalize_sdist.py --source-date-epoch "$SOURCE_DATE_EPOCH" package-dist/*.tar.gz
+          python -I scripts/verify_distribution.py package-dist --version "$RELEASE_VERSION"
+          python -I -m twine check package-dist/*
+          python -I scripts/prepare_release.py --version "$RELEASE_VERSION" --source-commit "$RELEASE_COMMIT" --dist-dir package-dist --output-dir dist
+      - name: Bind the candidate bytes
+        id: final
+        run: echo "manifest=$(python -I scripts/verify_release_integrity.py assets dist -)" >> "$GITHUB_OUTPUT"
+      - name: Transfer immutable candidate
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: candidate
+          path: dist/
+          if-no-files-found: error
 
-      - name: Attest release assets
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+  verify:
+    name: Verify candidate on a clean read-only runner
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.build.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          merge-multiple: true
+          path: candidate
+      - name: Verify installation manifests and rebuild source correspondence
+        env:
+          EXPECTED_MANIFEST: ${{ needs.build.outputs.manifest }}
+          RELEASE_COMMIT: ${{ needs.build.outputs.commit }}
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -I scripts/verify_release_integrity.py assets candidate "$EXPECTED_MANIFEST"
+          mkdir package-dist
+          cp candidate/*.whl candidate/*.tar.gz package-dist/
+          python -I scripts/verify_distribution.py package-dist --version "$RELEASE_VERSION"
+          python -I scripts/prepare_release.py --version "$RELEASE_VERSION" --source-commit "$RELEASE_COMMIT" --dist-dir package-dist --output-dir rebuilt
+          python -I scripts/verify_release_integrity.py assets rebuilt "$EXPECTED_MANIFEST"
+      - name: Transfer verified bytes
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: verified
+          path: rebuilt/
+          if-no-files-found: error
+
+  promote:
+    name: Attest and create a draft from verified bytes
+    needs: [build, verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.build.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          artifact-ids: ${{ needs.verify.outputs.artifact-id }}
+          merge-multiple: true
+          path: dist
+      - name: Reverify transferred bytes and tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_MANIFEST: ${{ needs.build.outputs.manifest }}
+          RELEASE_COMMIT: ${{ needs.build.outputs.commit }}
+        run: |
+          python -I scripts/verify_release_integrity.py assets dist "$EXPECTED_MANIFEST"
+          python -I scripts/verify_release_integrity.py tag "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$RELEASE_COMMIT"
+      - name: Attest only verified assets
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
         with:
           subject-path: dist/*
-
-      - name: Create draft release
-        shell: bash
+      - name: Create and verify draft
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_VERSION: ${{ steps.identity.outputs.version }}
-          RELEASE_COMMIT: ${{ steps.identity.outputs.commit }}
-        run: |
-          set -euo pipefail
-          gh release create "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" \
-            --draft \
-            --verify-tag \
-            --target "$RELEASE_COMMIT" \
-            --title "IDS Rule Converter $RELEASE_VERSION" \
-            --notes-file ".github/release-notes/$GITHUB_REF_NAME.md" \
-            "dist/IDS-Rule-Converter-v$RELEASE_VERSION.py" \
-            "dist/IDS-Rule-Converter-v$RELEASE_VERSION.zip" \
-            "dist/ids_rule_converter-$RELEASE_VERSION-py3-none-any.whl" \
-            "dist/ids_rule_converter-$RELEASE_VERSION.tar.gz" \
-            "dist/IDS-Rule-Converter-v$RELEASE_VERSION.spdx.json" \
-            "dist/SHA256SUMS.txt" \
-            "dist/release-evidence.json"
-
-      - name: Verify exact draft state
+          EXPECTED_MANIFEST: ${{ needs.build.outputs.manifest }}
+          RELEASE_COMMIT: ${{ needs.build.outputs.commit }}
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_VERSION: ${{ steps.identity.outputs.version }}
         run: |
           set -euo pipefail
-          gh release view "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" \
-            --json isDraft,isPrerelease,assets > release-state.json
-          python - "$RELEASE_VERSION" <<'PY'
-          import json
-          import sys
-
-          version = sys.argv[1]
-          state = json.load(open("release-state.json", encoding="utf-8"))
-          expected = {
-              f"IDS-Rule-Converter-v{version}.py",
-              f"IDS-Rule-Converter-v{version}.zip",
-              f"ids_rule_converter-{version}-py3-none-any.whl",
-              f"ids_rule_converter-{version}.tar.gz",
-              f"IDS-Rule-Converter-v{version}.spdx.json",
-              "SHA256SUMS.txt",
-              "release-evidence.json",
-          }
-          actual = {asset["name"] for asset in state["assets"]}
-          if state["isDraft"] is not True or state["isPrerelease"] is not False:
-              raise SystemExit("Release must remain a non-prerelease draft")
-          if actual != expected:
-              raise SystemExit(f"Unexpected release asset set: {sorted(actual)}")
-          PY
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --target "$RELEASE_COMMIT" --title "IDS Rule Converter $RELEASE_VERSION" --notes-file ".github/release-notes/$GITHUB_REF_NAME.md" dist/*
+          if ! python -I scripts/verify_release_integrity.py tag "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$RELEASE_COMMIT"; then
+            gh release delete "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --yes
+            exit 1
+          fi
+          test "$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
+          test "$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isPrerelease --jq .isPrerelease)" = false
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir readback
+          python -I scripts/verify_release_integrity.py assets readback "$EXPECTED_MANIFEST"
