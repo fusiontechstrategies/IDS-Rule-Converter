@@ -23,6 +23,55 @@ RULE = 'alert tcp any any -> any 80 (content:"test"; sid:1001;)'
 
 
 class SecurityRegressions(unittest.TestCase):
+    def test_panorama_review_failure_cannot_leave_usable_batches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            source, output = parent / "input", parent / "output"
+            source.write_text(
+                'alert tcp any any -> any 80 (msg:"test"; content:"test"; sid:1001; rev:1;)',
+                encoding="utf-8",
+            )
+            original = converter.atomic_write_text
+
+            def write(path, text, force=False):
+                if path.name == "panorama_preflight.json":
+                    raise converter.ConverterError("synthetic review publication failure")
+                return original(path, text, force)
+
+            with patch.object(converter, "atomic_write_text", side_effect=write):
+                result = converter.main(
+                    ["panorama-preflight", str(source), "--output-dir", str(output)]
+                )
+            self.assertEqual(result, converter.EXIT_OPERATIONAL_ERROR)
+            self.assertEqual(list(output.glob("panorama_batch_*.rules")), [])
+
+    @unittest.skipIf(os.name == "nt", "POSIX link semantics")
+    def test_panorama_and_fetch_reject_output_directory_links(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            source, target, link = parent / "input", parent / "target", parent / "link"
+            source.write_text(RULE, encoding="utf-8")
+            target.mkdir()
+            link.symlink_to(target, target_is_directory=True)
+            self.assertEqual(
+                converter.main(["panorama-preflight", str(source), "--output-dir", str(link)]),
+                converter.EXIT_OPERATIONAL_ERROR,
+            )
+            with patch.object(converter, "download_feed", return_value=(b"synthetic", {})):
+                self.assertEqual(
+                    converter.main(
+                        [
+                            "fetch",
+                            "--source",
+                            next(iter(converter.FEEDS)),
+                            "--output-dir",
+                            str(link),
+                        ]
+                    ),
+                    converter.EXIT_OPERATIONAL_ERROR,
+                )
+            self.assertEqual(list(target.iterdir()), [])
+
     def test_required_review_failure_cannot_leave_a_primary_ruleset(self):
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory)
