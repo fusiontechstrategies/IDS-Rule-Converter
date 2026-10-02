@@ -9,7 +9,7 @@ import tempfile
 import tracemalloc
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import snort_suricata_rule_converter as converter
 
@@ -18,6 +18,23 @@ AMBIGUOUS = 'alert tcp any any -> any 80 (content:"A"; http_header; content:"B";
 
 
 class ExtraHighBoundaries(unittest.TestCase):
+    def test_oversized_or_invalid_content_length_rejected_before_body_read(self):
+        source_name = next(iter(converter.FEEDS))
+        for header in (str(converter.MAX_DOWNLOAD_BYTES + 1), "9" * 10000, "not-a-number", "-1"):
+            with self.subTest(header=header[:40]):
+                response = MagicMock()
+                response.__enter__.return_value = response
+                response.geturl.return_value = converter.FEEDS[source_name]["url"]
+                response.headers = {"Content-Length": header}
+                opener = MagicMock()
+                opener.open.return_value = response
+                with (
+                    patch.object(converter.urllib.request, "build_opener", return_value=opener),
+                    self.assertRaises(converter.ConverterError),
+                ):
+                    converter.download_feed(source_name)
+                response.read.assert_not_called()
+
     def test_expanded_inline_modifiers_cannot_bypass_option_cap(self):
         modifiers = ",".join(["within 1"] * 300)
         text = f'alert tcp any any -> any 80 (content:"x",{modifiers}; msg:"x"; sid:1;)'

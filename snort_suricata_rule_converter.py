@@ -3337,9 +3337,11 @@ def download_feed(source_name: str) -> tuple[bytes, dict[str, Any]]:
             length_header = response.headers.get("Content-Length")
             if length_header:
                 try:
-                    declared = bounded_decimal(length_header, maximum=MAX_DOWNLOAD_BYTES)
-                except ValueError:
-                    declared = 0
+                    declared = bounded_decimal(length_header)
+                except ValueError as exc:
+                    raise ConverterError(
+                        "Server declared an invalid or unsupported Content-Length"
+                    ) from exc
                 if declared > MAX_DOWNLOAD_BYTES:
                     raise ConverterError(
                         f"Server declared {declared:,} bytes; limit is {MAX_DOWNLOAD_BYTES:,}"
