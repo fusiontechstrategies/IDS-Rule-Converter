@@ -23,6 +23,41 @@ RULE = 'alert tcp any any -> any 80 (content:"test"; sid:1001;)'
 
 
 class SecurityRegressions(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows cleanup sharing semantics")
+    def test_windows_cleanup_keeps_guards_through_unlink_on_success_and_failure(self):
+        original_unlink, original_link = Path.unlink, os.link
+        for fail in (False, True):
+            with self.subTest(fail=fail), tempfile.TemporaryDirectory() as directory:
+                parent = Path(directory) / "reports"
+                parent.mkdir()
+                output = parent / "result.json"
+                cleaned = []
+
+                def unlink(
+                    path, *args, parent=parent, directory=directory, cleaned=cleaned, **kwargs
+                ):
+                    if path.name == "report" and path.parent.name.startswith(".govhawk-private-"):
+                        with self.assertRaises(PermissionError):
+                            path.parent.rename(parent / "replacement")
+                        with self.assertRaises(PermissionError):
+                            parent.rename(Path(directory) / "replacement-parent")
+                        cleaned.append(path)
+                    return original_unlink(path, *args, **kwargs)
+
+                def link(*args, fail=fail, **kwargs):
+                    if fail:
+                        raise OSError("synthetic publication failure")
+                    return original_link(*args, **kwargs)
+
+                with patch.object(Path, "unlink", unlink), patch.object(converter.os, "link", link):
+                    if fail:
+                        with self.assertRaisesRegex(OSError, "synthetic publication failure"):
+                            converter.atomic_write_bytes(output, b"synthetic")
+                    else:
+                        converter.atomic_write_bytes(output, b"synthetic")
+                self.assertEqual(len(cleaned), 1)
+                self.assertEqual(list(parent.iterdir()), [] if fail else [output])
+
     def test_panorama_review_failure_cannot_leave_usable_batches(self):
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory)
