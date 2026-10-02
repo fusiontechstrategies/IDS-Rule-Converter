@@ -41,6 +41,24 @@ and outputs are written atomically.
 Converted rules are untrusted configuration data. Validate them with the target
 engine and review rejected or unverified mappings before deployment.
 
+Malformed block comments and invalid inline content modifiers stop conversion.
+Strict conversion rejects field-specific buffers when the target cannot preserve
+their meaning. Source filenames are JSON-escaped inside generated comments.
+
+Output leaf links and reparse points are rejected even with `--force`. POSIX
+publication uses a pinned directory descriptor and requires an owner-controlled
+parent. Extraction roots cannot be links; fetch uses an exclusively created
+extraction directory. TAR parsing bounds entries, declared file sizes,
+decompressed stream bytes, extension metadata, and extension chains before
+materializing the full member list. Sparse archives are unsupported.
+
+Release builds have read-only repository permissions and use fully hash-locked
+build dependencies. A separate clean runner verifies exact wheel and source
+archive installation manifests and correspondence with reviewed source. Only
+verified immutable artifacts reach the attestation and draft-release job.
+Privileged verification uses Python isolated mode. Source review and signed
+commit validation remain necessary; releases stay drafts for explicit approval.
+
 ## Out of scope
 
 - Vulnerabilities in Snort, Suricata, Panorama, Python, Docker, or GitHub

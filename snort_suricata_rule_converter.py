@@ -9,21 +9,25 @@ modifiers are not silently discarded during conversion.
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import io
 import json
 import os
 import re
 import ssl
+import stat
 import sys
 import tarfile
 import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import zipfile
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -369,6 +373,12 @@ class ConverterError(Exception):
     """Expected, user-facing operational failure."""
 
 
+class UnterminatedBlockComment(ConverterError):
+    def __init__(self, line: int):
+        self.line = line
+        super().__init__(f"UNTERMINATED_BLOCK_COMMENT at line {line}")
+
+
 @dataclass(frozen=True)
 class Diagnostic:
     severity: str
@@ -553,9 +563,16 @@ def read_utf8(path: Path, max_bytes: int = MAX_INPUT_BYTES) -> tuple[str, int]:
 
 
 def ensure_output_path(path: Path, force: bool) -> Path:
-    resolved_parent = path.expanduser().resolve().parent
+    requested = path.expanduser().absolute()
+    resolved_parent = requested.parent.resolve()
     resolved_parent.mkdir(parents=True, exist_ok=True)
-    resolved = resolved_parent / path.name
+    resolved = resolved_parent / requested.name
+    if resolved.is_symlink() or (
+        resolved.exists()
+        and getattr(resolved.lstat(), "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    ):
+        raise ConverterError(f"Output leaf is a link or reparse point: {resolved}")
     if resolved.exists() and resolved.is_dir():
         raise ConverterError(f"Output path is a directory: {resolved}")
     if resolved.exists() and not force:
@@ -566,7 +583,7 @@ def ensure_output_path(path: Path, force: bool) -> Path:
 def ensure_outputs_available(paths: Iterable[Path], force: bool) -> None:
     seen: set[str] = set()
     for path in paths:
-        resolved = path.expanduser().resolve()
+        resolved = ensure_output_path(path, force)
         key = os.path.normcase(str(resolved))
         if key in seen:
             raise ConverterError(f"The same output path was requested more than once: {resolved}")
@@ -580,13 +597,55 @@ def ensure_outputs_available(paths: Iterable[Path], force: bool) -> None:
 def ensure_outputs_do_not_replace_inputs(outputs: Iterable[Path], inputs: Iterable[Path]) -> None:
     protected = {os.path.normcase(str(path.expanduser().resolve())) for path in inputs}
     for path in outputs:
-        resolved = path.expanduser().resolve()
+        resolved = ensure_output_path(path, True)
         if os.path.normcase(str(resolved)) in protected:
             raise ConverterError(f"Output path would replace an input file: {resolved}")
 
 
 def atomic_write_bytes(path: Path, data: bytes, force: bool = False) -> Path:
     destination = ensure_output_path(path, force)
+    if os.name != "nt":
+        directory = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        temporary_name = f".ids-{uuid.uuid4().hex}.tmp"
+        try:
+            info = os.fstat(directory)
+            if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o022:
+                raise ConverterError(
+                    "Output parent must be owned by this user and not writable by others"
+                )
+            fd = os.open(
+                temporary_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=directory,
+            )
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                leaf = os.stat(destination.name, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                leaf = None
+            if leaf is not None and not stat.S_ISREG(leaf.st_mode):
+                raise ConverterError("Output leaf must be a regular file")
+            if force:
+                os.replace(
+                    temporary_name, destination.name, src_dir_fd=directory, dst_dir_fd=directory
+                )
+            else:
+                os.link(
+                    temporary_name,
+                    destination.name,
+                    src_dir_fd=directory,
+                    dst_dir_fd=directory,
+                    follow_symlinks=False,
+                )
+        finally:
+            with suppress(FileNotFoundError):
+                os.unlink(temporary_name, dir_fd=directory)
+            os.close(directory)
+        return destination
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
     )
@@ -625,10 +684,14 @@ def strip_rule_comments(text: str) -> str:
     escaped = False
     line_comment = False
     block_comment = False
+    block_start_line = 1
+    line = 1
     line_has_nonspace = False
     index = 0
     while index < len(text):
         char = text[index]
+        if char == "\n":
+            line += 1
         next_char = text[index + 1] if index + 1 < len(text) else ""
         if line_comment:
             if char == "\n":
@@ -674,6 +737,7 @@ def strip_rule_comments(text: str) -> str:
             continue
         if char == "/" and next_char == "*":
             block_comment = True
+            block_start_line = line
             output.extend((" ", " "))
             index += 2
             continue
@@ -683,6 +747,8 @@ def strip_rule_comments(text: str) -> str:
         elif not char.isspace():
             line_has_nonspace = True
         index += 1
+    if block_comment:
+        raise UnterminatedBlockComment(block_start_line)
     return "".join(output)
 
 
@@ -795,7 +861,15 @@ class RuleParser:
 
     def parse_text(self, text: str, source: str = "<memory>") -> ParseResult:
         result = ParseResult(source=source, byte_count=len(text.encode("utf-8")))
-        cleaned = strip_rule_comments(text)
+        try:
+            cleaned = strip_rule_comments(text)
+        except UnterminatedBlockComment as exc:
+            result.diagnostics.append(
+                Diagnostic(
+                    "error", "UNTERMINATED_BLOCK_COMMENT", str(exc), source, exc.line, exc.line
+                )
+            )
+            return result
         for record_index, (raw, start_line, end_line) in enumerate(
             self._records(cleaned, result), 1
         ):
@@ -1021,6 +1095,28 @@ class RuleParser:
                         )
                         continue
                     modifier_name, modifier_value = match.group(1), match.group(2)
+                    no_value = {"nocase", "rawbytes", "startswith", "endswith"}
+                    optional_value = {"fast_pattern"}
+                    if (
+                        modifier_name.lower() not in CONTENT_MODIFIERS
+                        or (modifier_name.lower() in no_value and modifier_value is not None)
+                        or (
+                            modifier_name.lower() not in no_value | optional_value
+                            and modifier_value is None
+                        )
+                    ):
+                        diagnostics.append(
+                            Diagnostic(
+                                "error",
+                                "INVALID_INLINE_MODIFIER",
+                                f"Invalid inline content modifier '{modifier_name}'",
+                                source,
+                                start_line,
+                                end_line,
+                                index,
+                            )
+                        )
+                        continue
                     options.append(
                         RuleOption(
                             name=modifier_name,
@@ -1773,6 +1869,16 @@ def compatibility_diagnostics(
                 source_dialect == "snort3" and key in LEGACY_TO_DOTTED_BUFFER
             ):
                 active_buffer = DOTTED_TO_LEGACY_BUFFER.get(key, key)
+                if option.value is not None:
+                    diagnostics.append(
+                        option_diagnostic(
+                            rule,
+                            "error",
+                            "UNSUPPORTED_BUFFER_ARGUMENT",
+                            f"Sticky buffer '{option.name}' argument has no proven Snort 2 equivalent",
+                            option.name,
+                        )
+                    )
             elif key in {"pkt_data", "raw_data", "file_data", "file.data"}:
                 active_buffer = None
             elif active_buffer is not None and key in payload_noncontent:
@@ -2579,33 +2685,83 @@ def safe_archive_name(name: str) -> PurePosixPath:
     return path
 
 
+class BoundedTarInfo(tarfile.TarInfo):
+    """Reject oversized extension metadata before tarfile reads or allocates it."""
+
+    def _metadata_budget(self, archive):
+        archive._ids_metadata_bytes = getattr(archive, "_ids_metadata_bytes", 0) + self.size
+        archive._ids_extension_count = getattr(archive, "_ids_extension_count", 0) + 1
+        if (
+            self.size < 0
+            or self.size > 1024 * 1024
+            or archive._ids_metadata_bytes > 8 * 1024 * 1024
+            or archive._ids_extension_count > 32
+        ):
+            raise ConverterError("TAR extension metadata exceeds its budget")
+
+    def _proc_pax(self, archive):
+        self._metadata_budget(archive)
+        return super()._proc_pax(archive)
+
+    def _proc_gnulong(self, archive):
+        self._metadata_budget(archive)
+        return super()._proc_gnulong(archive)
+
+    def _proc_sparse(self, archive):
+        raise ConverterError("Sparse TAR members are not supported")
+
+
+class DecompressionBudget:
+    def __init__(self, stream):
+        self.stream = stream
+        self.count = 0
+        self.limit = MAX_EXTRACTED_BYTES + MAX_ARCHIVE_ENTRIES * 1024 + 8 * 1024 * 1024
+
+    def read(self, size):
+        if size < 0 or self.count + size > self.limit:
+            raise ConverterError("TAR decompression exceeds its byte budget")
+        value = self.stream.read(size)
+        self.count += len(value)
+        return value
+
+
 def validate_tar_archive(data: bytes) -> list[tarfile.TarInfo]:
-    try:
-        with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as archive:
-            members = archive.getmembers()
-    except (tarfile.TarError, OSError) as exc:
-        raise ConverterError(f"Downloaded file is not a valid tar archive: {exc}") from exc
-    if len(members) > MAX_ARCHIVE_ENTRIES:
-        raise ConverterError(
-            f"Archive has {len(members):,} entries; limit is {MAX_ARCHIVE_ENTRIES:,}"
-        )
+    if not data.startswith(b"\x1f\x8b"):
+        raise ConverterError("Expected a gzip-compressed TAR archive")
+    members = []
     total = 0
     normalized_names: set[str] = set()
-    for member in members:
-        relative = safe_archive_name(member.name)
-        normalized = "/".join(relative.parts).casefold()
-        if normalized in normalized_names:
-            raise ConverterError(f"Archive contains duplicate paths: {member.name!r}")
-        normalized_names.add(normalized)
-        if member.issym() or member.islnk() or member.isdev() or member.isfifo():
-            raise ConverterError(f"Archive contains a link or special file: {member.name!r}")
-        if not (member.isfile() or member.isdir()):
-            raise ConverterError(f"Archive contains an unsupported entry: {member.name!r}")
-        if member.size < 0 or member.size > MAX_EXTRACTED_FILE_BYTES:
-            raise ConverterError(f"Archive entry is too large: {member.name!r}")
-        total += member.size
-        if total > MAX_EXTRACTED_BYTES:
-            raise ConverterError(f"Archive expands beyond the {MAX_EXTRACTED_BYTES:,} byte limit")
+    try:
+        with (
+            gzip.GzipFile(fileobj=io.BytesIO(data)) as compressed,
+            tarfile.open(
+                fileobj=DecompressionBudget(compressed), mode="r|", tarinfo=BoundedTarInfo
+            ) as archive,
+        ):
+            while True:
+                archive._ids_extension_count = 0
+                member = archive.next()
+                if member is None:
+                    break
+                if len(members) >= MAX_ARCHIVE_ENTRIES:
+                    raise ConverterError("TAR archive exceeds its entry limit")
+                relative = safe_archive_name(member.name)
+                normalized = "/".join(relative.parts).casefold()
+                if normalized in normalized_names:
+                    raise ConverterError(f"Archive contains duplicate paths: {member.name!r}")
+                normalized_names.add(normalized)
+                if not (member.isfile() or member.isdir()) or member.sparse is not None:
+                    raise ConverterError(
+                        f"Archive contains a link or special file: {member.name!r}"
+                    )
+                if member.size < 0 or member.size > MAX_EXTRACTED_FILE_BYTES:
+                    raise ConverterError(f"Archive entry is too large: {member.name!r}")
+                total += member.size
+                if total > MAX_EXTRACTED_BYTES:
+                    raise ConverterError("TAR archive exceeds its extracted byte limit")
+                members.append(member)
+    except (tarfile.TarError, OSError, EOFError, RecursionError) as exc:
+        raise ConverterError(f"Downloaded file is not a valid bounded TAR archive: {exc}") from exc
     return members
 
 
@@ -2641,6 +2797,12 @@ def validate_zip_archive(data: bytes) -> list[zipfile.ZipInfo]:
 
 
 def extract_archive(data: bytes, archive_type: str, output_dir: Path, force: bool) -> list[Path]:
+    if output_dir.is_symlink() or (
+        output_dir.exists()
+        and getattr(output_dir.lstat(), "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    ):
+        raise ConverterError("Extraction root cannot be a link or reparse point")
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
@@ -2658,7 +2820,7 @@ def extract_archive(data: bytes, archive_type: str, output_dir: Path, force: boo
             (destination_for(member.name) for member in members if member.isfile()),
             force,
         )
-        with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as archive:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
             for member in members:
                 destination = destination_for(member.name)
                 if member.isdir():
@@ -2902,7 +3064,7 @@ def command_convert(args: argparse.Namespace) -> int:
     all_diagnostics = list(parsed.diagnostics) + converted.diagnostics
     output_lines = [
         f"# Generated by {APP_NAME} {VERSION}",
-        f"# Source: {Path(parsed.source).name}",
+        f"# Source: {json.dumps(Path(parsed.source).name, ensure_ascii=True)}",
         f"# Target dialect: {args.target}",
         f"# Rejected input rules: {len(converted.rejected_rule_indexes)}",
         "# Validate this ruleset with the target engine before deployment.",
@@ -2932,7 +3094,7 @@ def command_convert(args: argparse.Namespace) -> int:
         rejected_rules = [rule for rule in parsed.rules if rule.index in rejected_indexes]
         rejected_text = (
             f"# Rejected by {APP_NAME} {VERSION}\n"
-            f"# Source: {Path(parsed.source).name}\n"
+            f"# Source: {json.dumps(Path(parsed.source).name, ensure_ascii=True)}\n"
             "# See the JSON conversion report for incompatibility details.\n\n"
             + "\n".join(rule.raw.strip() for rule in rejected_rules)
             + "\n"
@@ -3046,6 +3208,9 @@ def command_fetch(args: argparse.Namespace) -> int:
             if not (isinstance(member, tarfile.TarInfo) and member.isdir())
             and not (isinstance(member, zipfile.ZipInfo) and member.is_dir())
         ]
+        if extraction_root.exists() or extraction_root.is_symlink():
+            raise ConverterError("Fetch extraction root must not already exist")
+        extraction_root.mkdir(mode=0o700)
         extraction_root_resolved = extraction_root.resolve()
         extraction_paths = []
         for name in names:
