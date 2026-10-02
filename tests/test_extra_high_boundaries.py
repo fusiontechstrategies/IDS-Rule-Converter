@@ -18,6 +18,57 @@ AMBIGUOUS = 'alert tcp any any -> any 80 (content:"A"; http_header; content:"B";
 
 
 class ExtraHighBoundaries(unittest.TestCase):
+    def test_expanded_inline_modifiers_cannot_bypass_option_cap(self):
+        modifiers = ",".join(["within 1"] * 300)
+        text = f'alert tcp any any -> any 80 (content:"x",{modifiers}; msg:"x"; sid:1;)'
+        with self.assertRaisesRegex(converter.ConverterError, "option budget"):
+            converter.RuleParser().parse_text(text)
+
+    def test_unknown_action_with_long_header_or_multiline_body_is_not_ignored(self):
+        records = (
+            "vendoraction tcp any any" + " " * 600 + '-> any any (msg:"x"; sid:1;)',
+            'vendoraction tcp\n(msg:"x"; sid:1;)',
+        )
+        for record in records:
+            with self.subTest(record=record):
+                parsed = converter.RuleParser().parse_text(record)
+                self.assertEqual(parsed.rules, [])
+                self.assertTrue(parsed.errors)
+                self.assertEqual(parsed.ignored_directives, 0)
+
+    def test_conversion_and_panorama_diagnostic_fanout_abort(self):
+        text = "\n".join(
+            f'alert tcp any any -> any 80 (content:"test"; vendor_unknown:1; msg:"x"; sid:{index};)'
+            for index in range(1, 6)
+        )
+        parsed = converter.RuleParser().parse_text(text)
+        with patch.object(converter, "MAX_DIAGNOSTICS", 3):
+            with self.assertRaisesRegex(converter.ConverterError, "Diagnostic budget"):
+                converter.convert_rules(parsed.rules, "suricata")
+            with self.assertRaisesRegex(converter.ConverterError, "Diagnostic budget"):
+                converter.build_panorama_report(parsed)
+
+    def test_all_numeric_identity_and_threshold_fields_are_bounded(self):
+        for field in ("sid", "gid", "rev"):
+            text = RULE.replace("sid:1001;", f"sid:1001; {field}:" + "9" * 10000 + ";")
+            if field == "sid":
+                text = RULE.replace("sid:1001", "sid:" + "9" * 10000)
+            with self.subTest(field=field):
+                parsed = converter.RuleParser().parse_text(text)
+                self.assertEqual(parsed.rules, [])
+                self.assertTrue(parsed.errors)
+        parsed = converter.RuleParser().parse_text(
+            RULE.replace(
+                "sid:1001;",
+                "threshold:type limit, track by_src, count "
+                + "9" * 10000
+                + ", seconds 1; sid:1001;",
+            )
+        )
+        _, _, rejected, diagnostics = converter.build_panorama_report(parsed)
+        self.assertEqual(len(rejected), 1)
+        self.assertIn("PANORAMA_THRESHOLD_NOT_INTEGER", {item.code for item in diagnostics})
+
     def test_ambiguous_buffer_order_requires_explicit_source(self):
         parsed = converter.RuleParser().parse_text(AMBIGUOUS)
         for strict in (True, False):

@@ -456,7 +456,7 @@ class Rule:
         if value is None:
             return default
         try:
-            return int(value.strip(), 10)
+            return bounded_decimal(value)
         except ValueError:
             return default
 
@@ -1051,7 +1051,7 @@ def strip_rule_comments(text: str) -> str:
     return output.getvalue()
 
 
-def split_top_level(text: str, delimiter: str) -> list[str]:
+def split_top_level(text: str, delimiter: str, *, max_parts: int | None = None) -> list[str]:
     parts: list[str] = []
     start = 0
     quote = False
@@ -1079,9 +1079,36 @@ def split_top_level(text: str, delimiter: str) -> list[str]:
             round_depth -= 1
         elif char == delimiter and square == 0 and round_depth == 0:
             parts.append(text[start:index])
+            if max_parts is not None and len(parts) >= max_parts:
+                raise ConverterError("Rule option budget exceeded; declare a smaller rule")
             start = index + 1
     parts.append(text[start:])
+    if max_parts is not None and len(parts) > max_parts:
+        raise ConverterError("Rule option budget exceeded; declare a smaller rule")
     return parts
+
+
+def bounded_decimal(value: str, *, maximum: int = 4_294_967_295) -> int:
+    text = value.strip()
+    if not re.fullmatch(r"[0-9]{1,10}", text):
+        raise ValueError("Expected a bounded unsigned decimal integer")
+    number = int(text, 10)
+    if number > maximum:
+        raise ValueError("Decimal integer exceeds its supported range")
+    return number
+
+
+def valid_rule_identity(value: str) -> bool:
+    try:
+        return bounded_decimal(value) > 0
+    except ValueError:
+        return False
+
+
+def extend_diagnostics(destination: list[Diagnostic], values: Sequence[Diagnostic]) -> None:
+    if len(destination) + len(values) > MAX_DIAGNOSTICS:
+        raise ConverterError("Diagnostic budget exceeded; no partial output is safe")
+    destination.extend(values)
 
 
 def split_option(option_text: str) -> tuple[str, str | None]:
@@ -1183,7 +1210,7 @@ class RuleParser:
             if record_index > MAX_PARSED_RULES:
                 raise ConverterError("Parser rule count budget exceeded; no partial output is safe")
             rule, diagnostics = self._parse_record(raw, source, start_line, end_line, record_index)
-            result.diagnostics.extend(diagnostics)
+            extend_diagnostics(result.diagnostics, diagnostics)
             if len(result.diagnostics) > MAX_DIAGNOSTICS:
                 raise ConverterError("Parser diagnostic budget exceeded; no partial output is safe")
             if rule is not None:
@@ -1213,9 +1240,20 @@ class RuleParser:
                 line_end = length
             token_match = re.match(r"[A-Za-z_][A-Za-z0-9_-]*", text[index:line_end])
             token = token_match.group(0).lower() if token_match else ""
-            header_preview = text[index : min(line_end, index + 512)]
-            looks_like_rule = ("->" in header_preview or "<>" in header_preview) or (
-                "(" in header_preview and len(split_header(header_preview.split("(", 1)[0])) == 2
+            if line_end - index > MAX_RULE_CHARS:
+                raise ConverterError("Input line exceeds the rule classification budget")
+            header_preview = text[index:line_end]
+            following_index = line_end
+            following_limit = min(length, line_end + MAX_RULE_CHARS)
+            while following_index < following_limit and text[following_index].isspace():
+                following_index += 1
+            looks_like_rule = (
+                ("->" in header_preview or "<>" in header_preview)
+                or (
+                    "(" in header_preview
+                    and len(split_header(header_preview.split("(", 1)[0])) == 2
+                )
+                or text.startswith(("(", "->", "<>"), following_index)
             )
             if token not in RULE_ACTIONS and not looks_like_rule:
                 result.ignored_directives += 1
@@ -1364,7 +1402,7 @@ class RuleParser:
                     index,
                 )
             )
-        option_parts = split_top_level(body, ";")
+        option_parts = split_top_level(body, ";", max_parts=MAX_RULE_OPTIONS + 1)
         if len(option_parts) > MAX_RULE_OPTIONS + 1:
             raise ConverterError("Rule option budget exceeded; declare a smaller rule")
         if body.strip() and option_parts[-1].strip():
@@ -1381,6 +1419,8 @@ class RuleParser:
             )
         options: list[RuleOption] = []
         for part in option_parts[:-1] if body.strip() else []:
+            if len(options) >= MAX_RULE_OPTIONS:
+                raise ConverterError("Rule option budget exceeded; declare a smaller rule")
             stripped = part.strip()
             if not stripped:
                 continue
@@ -1399,7 +1439,12 @@ class RuleParser:
                 )
                 continue
             if name.lower() == "content" and value is not None:
-                content_parts = [item.strip() for item in split_top_level(value, ",")]
+                content_parts = [
+                    item.strip()
+                    for item in split_top_level(
+                        value, ",", max_parts=MAX_RULE_OPTIONS - len(options)
+                    )
+                ]
                 options.append(RuleOption(name=name, value=content_parts[0], raw=stripped))
                 for modifier in content_parts[1:]:
                     if not modifier:
@@ -1526,13 +1571,13 @@ class RuleParser:
                     "sid",
                 )
             )
-        elif not re.fullmatch(r"[1-9][0-9]*", sid_values[0].strip()):
+        elif not valid_rule_identity(sid_values[0]):
             diagnostics.append(
                 option_diagnostic(
                     rule,
                     "error",
                     "INVALID_SID",
-                    "sid must be a positive integer",
+                    "sid must be a positive unsigned 32-bit integer",
                     "sid",
                 )
             )
@@ -1548,13 +1593,13 @@ class RuleParser:
                         name,
                     )
                 )
-            elif values and not re.fullmatch(r"[1-9][0-9]*", values[0].strip()):
+            elif values and not valid_rule_identity(values[0]):
                 diagnostics.append(
                     option_diagnostic(
                         rule,
                         "error",
                         f"INVALID_{name.upper()}",
-                        f"{name} must be a positive integer",
+                        f"{name} must be a positive unsigned 32-bit integer",
                         name,
                     )
                 )
@@ -2260,6 +2305,8 @@ def convert_rules(
 ) -> ConversionResult:
     result = ConversionResult(target=target)
     for rule in rules:
+        if len(result.diagnostics) >= MAX_DIAGNOSTICS:
+            raise ConverterError("Diagnostic budget exceeded; no partial output is safe")
         dialect = infer_dialect(rule) if source_dialect == "auto" else source_dialect
         if dialect == "ambiguous":
             result.diagnostics.append(
@@ -2273,13 +2320,15 @@ def convert_rules(
             result.rejected_rule_indexes.append(rule.index)
             continue
         diagnostics, unverified = compatibility_diagnostics(rule, target, strict, dialect)
-        result.diagnostics.extend(diagnostics)
+        extend_diagnostics(result.diagnostics, diagnostics)
         result.unverified_keywords.update(unverified)
         if any(item.severity == "error" for item in diagnostics):
             result.rejected_rule_indexes.append(rule.index)
             continue
         result.rules.append(render_rule(rule, target, dialect))
     if result.unverified_keywords and not strict:
+        if len(result.diagnostics) >= MAX_DIAGNOSTICS:
+            raise ConverterError("Diagnostic budget exceeded; no partial output is safe")
         result.diagnostics.append(
             Diagnostic(
                 "warning",
@@ -2838,7 +2887,7 @@ def panorama_threshold_checks(rule: Rule, option: RuleOption) -> list[Diagnostic
         if match is None:
             continue
         try:
-            number = int(match.group(1).strip())
+            number = bounded_decimal(match.group(1))
         except ValueError:
             diagnostics.append(
                 option_diagnostic(
@@ -2873,7 +2922,7 @@ def build_panorama_report(
     parse_error_lines = {item.start_line for item in parsed.errors}
     for rule in parsed.rules:
         findings = panorama_option_checks(rule)
-        diagnostics.extend(findings)
+        extend_diagnostics(diagnostics, findings)
         errors = [item for item in findings if item.severity == "error"]
         if errors:
             rejected.append(rule)
@@ -3288,7 +3337,7 @@ def download_feed(source_name: str) -> tuple[bytes, dict[str, Any]]:
             length_header = response.headers.get("Content-Length")
             if length_header:
                 try:
-                    declared = int(length_header)
+                    declared = bounded_decimal(length_header, maximum=MAX_DOWNLOAD_BYTES)
                 except ValueError:
                     declared = 0
                 if declared > MAX_DOWNLOAD_BYTES:
@@ -3435,7 +3484,8 @@ def command_convert(args: argparse.Namespace) -> int:
         strict=not args.allow_unverified,
         source_dialect=args.source_dialect,
     )
-    all_diagnostics = list(parsed.diagnostics) + converted.diagnostics
+    all_diagnostics = list(parsed.diagnostics)
+    extend_diagnostics(all_diagnostics, converted.diagnostics)
     output_lines = [
         f"# Generated by {APP_NAME} {VERSION}",
         f"# Source: {json.dumps(Path(parsed.source).name, ensure_ascii=True)}",

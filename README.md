@@ -244,3 +244,15 @@ redistributed by this repository and retain their original terms.
 Snort is a registered trademark of Cisco. Suricata is a registered trademark of
 the Open Information Security Foundation. This project is independent and is not
 endorsed by either organization.
+
+### Immutable publication prerequisite
+
+Further PyPI promotion requires a public stable GitHub release whose REST API
+reports `immutable: true`. GitHub locks that release's tag and assets, closing
+the tag-mutation window between sequential authorization queries. Existing
+mutable releases are rejected rather than silently grandfathered in. Enable
+immutable releases before publishing the next fully assembled draft, following
+[GitHub's immutable release workflow](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases).
+The final job checks release identity and stable/public flags again after
+approval. GitHub still permits prerelease metadata changes; these flags are
+verified snapshots, not an atomic transaction spanning GitHub and PyPI.

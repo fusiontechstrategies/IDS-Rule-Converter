@@ -63,6 +63,7 @@ jobs:
           test "$(gh api "repos/$GH_REPO/commits/$commit" --jq '.commit.verification.verified')" = true
           test "$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')" = false
           test "$(gh release view "$RELEASE_TAG" --json isPrerelease --jq '.isPrerelease')" = false
+          test "$(gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" --jq '.immutable')" = true
           echo "source-commit=$commit" >> "$GITHUB_OUTPUT"
           echo "release-id=$(gh release view "$RELEASE_TAG" --json databaseId --jq '.databaseId')" >> "$GITHUB_OUTPUT"
           expected="$(printf '%s\n' \
@@ -196,6 +197,9 @@ jobs:
           assert re.fullmatch(r"[0-9a-f]{40}", commit)
           def api(path):
               return json.loads(subprocess.check_output(["gh", "api", f"repos/{repo}/{path}"], text=True))
+          locked_release = api(f"releases/tags/{quote(tag, safe='')}")
+          assert locked_release.get("immutable") is True
+          assert str(locked_release["id"]) == os.environ["VERIFIED_RELEASE_ID"]
           target = api(f"git/ref/tags/{quote(tag, safe='')}")["object"]
           for _ in range(8):
               if target["type"] == "commit":
@@ -206,6 +210,7 @@ jobs:
           assert api(f"commits/{commit}")["commit"]["verification"]["verified"] is True
           assert api(f"compare/{commit}...main")["status"] in ("identical", "ahead")
           release = api(f"releases/tags/{quote(tag, safe='')}")
+          assert release.get("immutable") is True
           assert str(release["id"]) == os.environ["VERIFIED_RELEASE_ID"]
           assert release["tag_name"] == tag and release["draft"] is False and release["prerelease"] is False
           PY

@@ -107,7 +107,16 @@ class PublicationFollowups(unittest.TestCase):
             "VERIFIED_COMMIT": commit,
             "VERIFIED_RELEASE_ID": "123",
         }
-        for mutation in (None, "tag", "signature", "main", "release", "draft", "prerelease"):
+        for mutation in (
+            None,
+            "tag",
+            "signature",
+            "main",
+            "release",
+            "draft",
+            "prerelease",
+            "mutable",
+        ):
             with self.subTest(mutation=mutation):
 
                 def response(arguments, mutation=mutation, **kwargs):
@@ -127,6 +136,7 @@ class PublicationFollowups(unittest.TestCase):
                     else:
                         value = {
                             "id": 124 if mutation == "release" else 123,
+                            "immutable": mutation != "mutable",
                             "tag_name": "v4.0.2",
                             "draft": mutation == "draft",
                             "prerelease": mutation == "prerelease",
