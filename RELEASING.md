@@ -8,7 +8,7 @@ IDS Rule Converter releases are built from a verified commit on protected `main`
 - The merge commit must be GitHub-verified and present on protected `main`.
 - The runtime `VERSION`, `BUILD_DATE`, changelog heading, and versioned release-notes file must agree.
 - Candidate builds must produce the exact seven-asset set documented below.
-- A tag push may create a draft GitHub release. It cannot publish the release.
+- A tag push builds a read-only candidate. A separate protected-main promotion workflow may create an approved draft. Neither publishes the release.
 - Release publication requires a separate maintainer review in GitHub.
 - Existing release assets are never replaced. A failed draft must be investigated and removed before a clean rerun.
 
@@ -65,15 +65,30 @@ Before tagging, require:
 
 Tag creation is a maintainer-controlled release action and requires explicit approval. The tag must be `vX.Y.Z` and must resolve to the approved protected-main commit.
 
-Pushing the tag starts `.github/workflows/release.yml`. The workflow:
+Pushing the tag starts `.github/workflows/release.yml`. The read-only workflow:
 
 1. Resolves the tag to its exact commit.
 2. Confirms the commit is reachable from `main` and has a valid GitHub verification record.
 3. Rebuilds the exact seven assets from source.
-4. Creates GitHub provenance attestations for all seven files.
-5. Refuses to continue if a release with the same tag already exists.
-6. Creates a draft GitHub release with the committed versioned notes.
-7. Confirms the draft contains exactly the expected assets.
+4. Verifies the candidate on another read-only runner and uploads the immutable seven-file handoff.
+
+On successful completion, `.github/workflows/release-promotion.yml` executes
+from protected `main`. It authenticates the producer API run and its exact
+artifact ID, pins a signed protected-main verification commit, and reads tagged
+source strictly as data. Trusted helpers independently verify the wheel/source
+archive and reconstruct every release subject. Tagged helper code never runs
+in jobs with OIDC, attestation or release-write permission.
+
+The main-only `release` environment requires a maintainer reviewer for both
+privileged jobs. Each repeats reconstruction before acting. Uploaded draft
+assets are downloaded and compared against the verified manifest. An explicitly
+authorized repository administrator can bypass environment approval;
+administrators and protected-main reviewers remain trusted operators.
+
+Attestations identify the protected-main promotion workflow and source ref.
+Selected-tag source identity remains separately bound by the exact runtime,
+distribution contents and reconstructed release evidence. The PyPI workflow
+requires this promotion provenance and retains its protected-main verifier.
 
 The workflow has no manual trigger and contains no publication command.
 

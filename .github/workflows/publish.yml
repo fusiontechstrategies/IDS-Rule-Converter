@@ -127,13 +127,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          commit="$(git rev-parse HEAD)"
           for asset in release-assets/*; do
             gh attestation verify "$asset" \
               --repo "$GH_REPO" \
-              --signer-workflow "$GH_REPO/.github/workflows/release.yml" \
-              --source-digest "$commit" \
-              --source-ref "refs/tags/$RELEASE_TAG"
+              --signer-workflow "$GH_REPO/.github/workflows/release-promotion.yml" \
+              --source-ref "refs/heads/main"
           done
 
       - name: Bind final publication bytes to attested originals
