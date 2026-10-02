@@ -2089,23 +2089,40 @@ def mapped_suricata_stream_size(value: str) -> str | None:
 
 
 def sip_relative_cursor_unsafe(options: Sequence[RuleOption]) -> bool:
-    return any(option.key in SNORT_TO_SURICATA_OPTION for option in options) and any(
+    if not any(option.key in SNORT_TO_SURICATA_OPTION for option in options):
+        return False
+    if any(
         option.key in {"distance", "within"}
         or (option.key == "pcre" and option.value is not None and "R" in pcre_flags(option.value))
         or (
-            option.key.startswith("byte_")
+            (
+                option.key.startswith("byte_")
+                or option.key in {"isdataat", "base64_decode", "asn1", "bufferlen"}
+            )
             and option.value is not None
-            and "relative" in {part.strip() for part in option.value.lower().split(",")}
+            and re.search(r"\brelative(?:_offset)?\b", option.value.lower()) is not None
         )
         for option in options
-    )
+    ):
+        return True
+    shorthand_since_pattern = False
+    for option in options:
+        if option.key in SNORT_TO_SURICATA_OPTION:
+            shorthand_since_pattern = True
+        elif option.key in {"content", "pcre"}:
+            shorthand_since_pattern = False
+        elif shorthand_since_pattern and option.key in CONTENT_MODIFIERS:
+            return True
+    return False
 
 
 def transform_to_suricata(
     options: Sequence[RuleOption], source_dialect: str, rule_protocol: str
 ) -> list[RuleOption]:
     if sip_relative_cursor_unsafe(options):
-        raise ConverterError("SIP shorthand cannot preserve a relative payload cursor")
+        raise ConverterError(
+            "SIP shorthand cannot preserve a relative payload cursor or displaced pattern modifier"
+        )
     if source_dialect == "snort2":
         options = transform_snort2_to_snort3(options)
         source_dialect = "snort3"
@@ -2190,6 +2207,7 @@ def transform_to_suricata(
                 "raw_data",
                 "file.data",
                 "file_data",
+                "base64_data",
             }:
                 active_buffer = selected
         index += 1
@@ -2347,7 +2365,7 @@ def compatibility_diagnostics(
                     rule,
                     "error",
                     "SIP_RELATIVE_CURSOR_UNSAFE",
-                    "SIP shorthand conversion cannot preserve a cross-buffer relative payload cursor",
+                    "SIP shorthand conversion cannot preserve relative payload cursors or displaced pattern modifiers",
                 )
             )
     for option_index, option in enumerate(rule.options):

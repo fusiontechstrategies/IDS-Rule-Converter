@@ -24,7 +24,11 @@ RULE = 'alert tcp any any -> any any (content:"marker"; sid:1001;)'
 class ConversionBoundaries(unittest.TestCase):
     def test_sip_generated_match_restores_packet_and_prior_file_buffers(self):
         for shorthand in ("sip_method:INVITE;", "sip_stat_code:200;", "sip_stat_code:2;"):
-            for selector, expected in (("", "pkt_data;"), ("file_data;", "file.data;")):
+            for selector, expected in (
+                ("", "pkt_data;"),
+                ("file_data;", "file.data;"),
+                ("base64_data;", "base64_data;"),
+            ):
                 for later in ('content:"marker";', 'pcre:"/marker/";', "byte_test:1,=,1,0;"):
                     with self.subTest(shorthand=shorthand, selector=selector, later=later):
                         parsed = app.RuleParser().parse_text(
@@ -42,6 +46,11 @@ class ConversionBoundaries(unittest.TestCase):
             'content:"x"; distance:0;',
             'pcre:"/x/R";',
             "byte_test:1,=,1,0, relative;",
+            "isdataat:1,relative;",
+            "base64_decode:bytes 8, offset 0, relative;",
+            "asn1:oversize_length 500,relative_offset 0;",
+            "nocase;",
+            "depth:4;",
         ):
             parsed = app.RuleParser().parse_text(
                 "alert tcp any any -> any any (sip_method:INVITE; " + relative + " sid:1001;)"
@@ -86,10 +95,13 @@ class ConversionBoundaries(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "input"
             source.write_text(RULE)
+            source = source.resolve()
             original = app.os.open
+            raced = []
 
             def raced_open(path, flags, *args, **kwargs):
                 if Path(path) == source:
+                    raced.append(True)
                     source.rename(source.with_name("original"))
                     source.write_text(RULE.replace("1001", "9999"))
                 return original(path, flags, *args, **kwargs)
@@ -99,6 +111,7 @@ class ConversionBoundaries(unittest.TestCase):
                 self.assertRaisesRegex(app.ConverterError, "identity changed"),
             ):
                 app.RuleParser().parse_file(source)
+            self.assertEqual(raced, [True])
 
     def test_actual_hardlink_and_case_alias_cannot_replace_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -120,7 +133,7 @@ class ConversionBoundaries(unittest.TestCase):
     @unittest.skipIf(os.name == "nt", "POSIX symlink fixture")
     def test_retargeted_input_alias_cannot_change_provenance_or_guard(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             first, second, alias = (root / name for name in ("first", "second", "alias"))
             first.write_text(RULE)
             second.write_text(RULE.replace("1001", "9999"))

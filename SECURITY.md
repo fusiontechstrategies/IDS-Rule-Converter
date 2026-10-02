@@ -86,7 +86,10 @@ which remains part of the repository's trusted operator boundary.
 
 SIP shorthand conversion restores the previous payload buffer after the generated
 SIP match. Rules combining these shorthands with relative payload cursors are
-refused because switching buffers cannot safely preserve that cursor. Every
+refused because switching buffers cannot safely preserve that cursor, including
+relative `isdataat`, Base64 decoding and ASN.1 offsets. A modifier separated from
+its source pattern by SIP shorthand is also refused. Restorable contexts include
+the decoded Base64 buffer. Every
 unquoted option semicolon is a delimiter, including inside brackets or parentheses.
 Quoted content remains intact. Panorama writes no batches or completion manifest
 when any input record fails parsing.
