@@ -51,7 +51,8 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
       - name: Install complete hash-locked build dependencies
-        run: python -I -m pip install --only-binary=:all: --require-hashes -r requirements-build-lock.txt
+        run: |
+          python -I -m pip install --only-binary=:all: --require-hashes -r requirements-build-lock.txt
       - name: Build and verify the candidate
         env:
           RELEASE_VERSION: ${{ steps.identity.outputs.version }}
