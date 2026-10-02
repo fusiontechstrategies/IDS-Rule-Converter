@@ -592,6 +592,8 @@ def current_windows_sid():
 
 def verify_windows_parent_security(handle, sid, require_user_owner=False):
     """Read existing security by pinned handle. Never rewrite caller directories."""
+    if sys.platform != "win32":
+        raise OSError("Windows security APIs require Windows")
     import ctypes.wintypes
 
     wintypes = ctypes.wintypes
@@ -621,6 +623,19 @@ def verify_windows_parent_security(handle, sid, require_user_owner=False):
     security.GetAce.restype = wintypes.BOOL
     kernel.LocalFree.argtypes = [ctypes.c_void_p]
     kernel.LocalFree.restype = ctypes.c_void_p
+    kernel.GetFinalPathNameByHandleW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    ]
+    kernel.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    canonical = ctypes.create_unicode_buffer(512)
+    length = kernel.GetFinalPathNameByHandleW(handle, canonical, len(canonical), 1)
+    volume_root = bool(
+        0 < length < len(canonical)
+        and re.fullmatch(r"\\\\\?\\Volume\{[0-9A-Fa-f-]{36}\}\\", canonical.value)
+    )
 
     def sid_text(value):
         text = wintypes.LPWSTR()
@@ -645,8 +660,11 @@ def verify_windows_parent_security(handle, sid, require_user_owner=False):
         raise ctypes.WinError(error)
     try:
         actual_owner = sid_text(owner)
-        if actual_owner not in trusted or (require_user_owner and actual_owner != sid):
+        if actual_owner not in trusted:
             raise ConverterError("Output directory has an untrusted owner")
+        # OWNER RIGHTS denotes the owner whose SID was just validated, rather
+        # than an independent principal. Python's private temp directories use it.
+        trusted.add("S-1-3-4")
         if not dacl.value:
             raise ConverterError("Output directory has a NULL DACL")
         info = (wintypes.DWORD * 3)()
@@ -656,22 +674,32 @@ def verify_windows_parent_security(handle, sid, require_user_owner=False):
             raise ConverterError("Output directory ACL exceeds its inspection budget")
         # ADD_FILE or WRITE_ATTRIBUTES can authorize reparse-point retargeting
         # after our handles close, including on an intermediate directory.
-        dangerous = 0x2 | 0x100 | 0x40 | 0x10000 | 0x40000 | 0x80000 | 0x10000000 | 0x40000000
+        dangerous = 0x40 | 0x40000 | 0x80000
+        if not volume_root:
+            dangerous |= 0x2 | 0x100 | 0x10000
         if require_user_owner:
             dangerous |= 0x2 | 0x4 | 0x10 | 0x100
         for index in range(info[0]):
             ace = ctypes.c_void_p()
             if not security.GetAce(dacl, index, ctypes.byref(ace)):
                 raise ctypes.WinError(ctypes.get_last_error())
-            header = (ctypes.c_ubyte * 4).from_address(ace.value)
+            address = ace.value
+            if address is None:
+                raise ConverterError("Missing output directory permission ACE")
+            header = (ctypes.c_ubyte * 4).from_address(address)
             if header[1] & 0x08:  # INHERIT_ONLY cannot authorize mutation of this directory.
                 continue
             if header[0] == 1:  # Ignoring denies conservatively refuses ambiguous grants.
                 continue
             if header[0] != 0 or int.from_bytes(bytes(header[2:4]), "little") < 12:
                 raise ConverterError("Unsupported output directory permission ACE")
-            mask = ctypes.c_uint32.from_address(ace.value + 4).value
-            if mask & dangerous and sid_text(ace.value + 8) not in trusted:
+            mask = ctypes.c_uint32.from_address(address + 4).value
+            # Expand generic file rights before examining the specific mask.
+            if mask & 0x10000000:
+                mask |= 0x1F01FF
+            if mask & 0x40000000:
+                mask |= 0x120116
+            if mask & dangerous and sid_text(address + 8) not in trusted:
                 raise ConverterError("Output directory can be modified by another user")
     finally:
         kernel.LocalFree(descriptor)
