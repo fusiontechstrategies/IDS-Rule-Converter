@@ -83,3 +83,43 @@ helpers are data and never run in attestation/write jobs. Each privileged job
 requires the main-only release environment and repeats subject verification.
 The required reviewer can be explicitly bypassed by an authorized administrator,
 which remains part of the repository's trusted operator boundary.
+
+SIP shorthand conversion restores the previous payload buffer after the generated
+SIP match. Rules combining these shorthands with relative payload cursors are
+refused because switching buffers cannot safely preserve that cursor, including
+relative `isdataat`, Base64 decoding and ASN.1 offsets. A modifier separated from
+its source pattern by SIP shorthand is also refused, including standalone `replace`.
+Snort 2 sticky payload contexts remain independent from backward content modifiers,
+including auto-detected `file_data` and the decoded Base64 buffer. Every
+one-shot backward content group restores the source payload context before any
+later non-modifier, including actual Base64 decoding and buffer-size tests.
+Cursor provenance remains independent from buffer selection across flow, metadata
+and other intervening options. Generated restoration cannot recover an earlier
+pattern cursor. Relative consumers and relative content are refused until a real
+positive content match or explicit source buffer selection establishes a safe
+cursor; a negative match does not establish one. All refusals apply in strict,
+non-strict and direct rendering paths. Direct rendering also refuses unsupported
+relative, negated, empty or inclusive-range bufferlen mappings to bsize. Public
+and direct paths share one bounded numeric mapping: absolute values from 0 to
+65535, supported comparisons and ascending exclusive ranges. Tabs and newlines
+cannot hide a relative qualifier. This follows the [Snort bufferlen grammar](https://docs.snort.org/rules/options/payload/bufferlen)
+and [Suricata bsize grammar](https://docs.suricata.io/en/suricata-8.0.7/rules/payload-keywords.html#bsize).
+Every
+unquoted option semicolon is a delimiter, including inside brackets or parentheses.
+Quoted content remains intact. Panorama writes no batches or completion manifest
+when any input record fails parsing.
+
+File parsing checks the actual opened descriptor against the named file, requires
+a regular bounded stable snapshot, and retains its path and device/inode identity
+for provenance and output protection. Output commands never resolve the original
+input alias again. They reject hardlink, case and Unicode-normalization aliases and
+recheck input identity immediately before forced replacement in a trusted output
+directory. Case/Unicode spelling checks are deliberately conservative even on a
+case-sensitive filesystem. Concurrent mutation by the same trusted user is outside
+the output-directory isolation guarantee; detected changes fail closed.
+
+Protected promotion validates bounded distribution contents, then rebuilds wheel
+and sdist containers with exact trusted sibling normalizers at the authenticated
+source epoch. Original producer bytes must equal those canonical bytes, including
+archive ordering, timestamps, modes, owners, comments, PAX data and gzip framing.
+Recomputing producer checksums or evidence cannot authorize noncanonical metadata.

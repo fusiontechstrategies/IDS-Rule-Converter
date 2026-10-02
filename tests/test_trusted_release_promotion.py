@@ -7,18 +7,21 @@ from pathlib import Path
 
 import test_security_regressions as fixtures
 
-from scripts import prepare_release, verify_release_handoff
+from scripts import normalize_sdist, normalize_wheel, prepare_release, verify_release_handoff
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = "4.0.2"
 COMMIT = "a" * 40
+EPOCH = 1767225600
 
 
 class TrustedReleasePromotionTests(unittest.TestCase):
     def candidate(self, root, source=ROOT):
         dist = root / "dist"
         dist.mkdir()
-        fixtures.SecurityRegressions().fixture_distributions(dist)
+        wheel, sdist = fixtures.SecurityRegressions().fixture_distributions(dist)
+        normalize_wheel.normalize_wheel(wheel, EPOCH)
+        normalize_sdist.normalize_sdist(sdist, EPOCH)
         assets = root / "assets"
         prepare_release.prepare_release(source, assets, VERSION, COMMIT, dist)
         return assets
@@ -27,15 +30,15 @@ class TrustedReleasePromotionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             assets = self.candidate(root)
-            result = verify_release_handoff.verify_handoff(assets, ROOT, COMMIT, 0)
+            result = verify_release_handoff.verify_handoff(assets, ROOT, COMMIT, EPOCH)
             self.assertEqual(result["tag"], "v" + VERSION)
             self.assertEqual(len(result["manifest"]), 7)
             with self.assertRaisesRegex(ValueError, "authenticated source identity"):
-                verify_release_handoff.verify_handoff(assets, ROOT, "b" * 40, 0)
+                verify_release_handoff.verify_handoff(assets, ROOT, "b" * 40, EPOCH)
             standalone = assets / f"IDS-Rule-Converter-v{VERSION}.py"
             standalone.write_bytes(standalone.read_bytes() + b"\n# replaced subject\n")
             with self.assertRaises(ValueError):
-                verify_release_handoff.verify_handoff(assets, ROOT, COMMIT, 0)
+                verify_release_handoff.verify_handoff(assets, ROOT, COMMIT, EPOCH)
 
     def test_tagged_release_helper_cannot_execute_in_trusted_reconstruction(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -55,7 +58,7 @@ class TrustedReleasePromotionTests(unittest.TestCase):
                 "raise RuntimeError('tagged code executed')\n"
             )
             assets = self.candidate(root, source)
-            result = verify_release_handoff.verify_handoff(assets, source, COMMIT, 0)
+            result = verify_release_handoff.verify_handoff(assets, source, COMMIT, EPOCH)
             self.assertEqual(result["version"], VERSION)
 
     def test_tag_build_cannot_supply_privileged_verification_code(self):

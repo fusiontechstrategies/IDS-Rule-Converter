@@ -68,10 +68,10 @@ class SecurityRegressions(unittest.TestCase):
             )
             original = converter.atomic_write_text
 
-            def write(path, text, force=False):
+            def write(path, text, force=False, **kwargs):
                 if path.name == "panorama_preflight.json":
                     raise converter.ConverterError("synthetic review publication failure")
-                return original(path, text, force)
+                return original(path, text, force, **kwargs)
 
             with patch.object(converter, "atomic_write_text", side_effect=write):
                 result = converter.main(
@@ -120,10 +120,10 @@ class SecurityRegressions(unittest.TestCase):
             )
             original = converter.atomic_write_text
 
-            def write(path, text, force=False):
+            def write(path, text, force=False, **kwargs):
                 if path == report:
                     raise converter.ConverterError("synthetic review publication failure")
-                return original(path, text, force)
+                return original(path, text, force, **kwargs)
 
             with patch.object(converter, "atomic_write_text", side_effect=write):
                 result = converter.main(

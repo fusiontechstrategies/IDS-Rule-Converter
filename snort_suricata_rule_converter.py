@@ -21,6 +21,7 @@ import stat
 import subprocess  # nosec B404
 import sys
 import tarfile
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -174,6 +175,10 @@ CONTENT_MODIFIERS = {
     "width",
     "within",
 }
+
+# This set is separate from inline content grammar: replace is a standalone
+# post-match option, but generated SIP content can displace its source pattern.
+DISPLACED_PATTERN_MODIFIERS = CONTENT_MODIFIERS | {"replace"}
 
 LEGACY_TO_DOTTED_BUFFER = {
     "dns_query": "dns.query",
@@ -503,6 +508,14 @@ class Rule:
         )
 
 
+@dataclass(frozen=True)
+class InputIdentity:
+    path: Path
+    device: int
+    inode: int
+    byte_count: int
+
+
 @dataclass
 class ParseResult:
     source: str
@@ -510,6 +523,7 @@ class ParseResult:
     diagnostics: list[Diagnostic] = field(default_factory=list)
     ignored_directives: int = 0
     byte_count: int = 0
+    input_identity: InputIdentity | None = None
 
     @property
     def errors(self) -> list[Diagnostic]:
@@ -544,19 +558,44 @@ def unquote(value: str) -> str:
     return ("!" if negated else "") + value
 
 
-def read_utf8(path: Path, max_bytes: int = MAX_INPUT_BYTES) -> tuple[str, int]:
+def read_input(path: Path, max_bytes: int = MAX_INPUT_BYTES) -> tuple[str, InputIdentity]:
     try:
         resolved = path.resolve(strict=True)
     except OSError as exc:
         raise ConverterError(f"Cannot access input file '{path}': {exc}") from exc
-    if not resolved.is_file():
-        raise ConverterError(f"Input is not a regular file: {resolved}")
-    size = resolved.stat().st_size
-    if size > max_bytes:
-        raise ConverterError(f"Input is {size:,} bytes; the limit is {max_bytes:,} bytes")
     try:
-        with resolved.open("rb") as stream:
+        expected = resolved.stat()
+        if not stat.S_ISREG(expected.st_mode):
+            raise ConverterError(f"Input is not a regular file: {resolved}")
+        descriptor = os.open(
+            resolved, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        )
+        with os.fdopen(descriptor, "rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if not stat.S_ISREG(opened.st_mode):
+                raise ConverterError(f"Input is not a regular file: {resolved}")
+            if (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino):
+                raise ConverterError("Input identity changed before reading")
+            if opened.st_size > max_bytes:
+                raise ConverterError(
+                    f"Input is {opened.st_size:,} bytes; the limit is {max_bytes:,} bytes"
+                )
             data = stream.read(max_bytes + 1)
+            after = os.fstat(stream.fileno())
+            named = resolved.stat()
+            if (
+                (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+                != (
+                    opened.st_dev,
+                    opened.st_ino,
+                    opened.st_size,
+                    opened.st_mtime_ns,
+                    opened.st_ctime_ns,
+                )
+                or (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)
+                or len(data) != opened.st_size
+            ):
+                raise ConverterError("Input changed during reading; no snapshot is safe")
         if len(data) > max_bytes:
             raise ConverterError(f"Input exceeds the {max_bytes:,} byte limit while reading")
     except OSError as exc:
@@ -564,11 +603,18 @@ def read_utf8(path: Path, max_bytes: int = MAX_INPUT_BYTES) -> tuple[str, int]:
     if b"\x00" in data:
         raise ConverterError(f"Input contains NUL bytes and is not a text ruleset: {resolved}")
     try:
-        return data.decode("utf-8-sig"), size
+        return data.decode("utf-8-sig"), InputIdentity(
+            resolved, opened.st_dev, opened.st_ino, len(data)
+        )
     except UnicodeDecodeError as exc:
         raise ConverterError(
             f"Input is not valid UTF-8 at byte {exc.start}. Convert it to UTF-8 before processing."
         ) from exc
+
+
+def read_utf8(path: Path, max_bytes: int = MAX_INPUT_BYTES) -> tuple[str, int]:
+    text, identity = read_input(path, max_bytes)
+    return text, identity.byte_count
 
 
 def current_windows_sid():
@@ -1023,7 +1069,7 @@ def ensure_outputs_available(paths: Iterable[Path], force: bool) -> None:
     seen: set[str] = set()
     for path in paths:
         resolved = ensure_output_path(path, force)
-        key = os.path.normcase(str(resolved))
+        key = portable_path_identity(resolved)
         if key in seen:
             raise ConverterError(f"The same output path was requested more than once: {resolved}")
         seen.add(key)
@@ -1033,12 +1079,47 @@ def ensure_outputs_available(paths: Iterable[Path], force: bool) -> None:
             raise ConverterError(f"Output already exists: {resolved}. Use --force to replace it.")
 
 
-def ensure_outputs_do_not_replace_inputs(outputs: Iterable[Path], inputs: Iterable[Path]) -> None:
-    protected = {os.path.normcase(str(path.expanduser().resolve())) for path in inputs}
+def portable_path_identity(path: Path) -> str:
+    return unicodedata.normalize("NFC", str(path.expanduser().absolute())).casefold()
+
+
+def ensure_outputs_do_not_replace_inputs(
+    outputs: Iterable[Path], inputs: Iterable[InputIdentity | Path]
+) -> None:
+    identities = []
+    for item in inputs:
+        if isinstance(item, InputIdentity):
+            identities.append(item)
+        else:
+            resolved = item.expanduser().resolve(strict=True)
+            info = resolved.stat()
+            identities.append(InputIdentity(resolved, info.st_dev, info.st_ino, info.st_size))
     for path in outputs:
         resolved = ensure_output_path(path, True)
-        if os.path.normcase(str(resolved.resolve())) in protected:
+        if any(
+            portable_path_identity(resolved) == portable_path_identity(item.path)
+            for item in identities
+        ):
             raise ConverterError(f"Output path would replace an input file: {resolved}")
+        try:
+            leaf = resolved.stat()
+        except FileNotFoundError:
+            leaf = None
+        refuse_input_leaf(leaf, identities)
+
+
+def refuse_input_leaf(info: os.stat_result | None, inputs: Iterable[InputIdentity]) -> None:
+    if info is not None and any(
+        (info.st_dev, info.st_ino) == (item.device, item.inode) for item in inputs
+    ):
+        raise ConverterError("Output file identity would replace a file read as input")
+
+
+def input_snapshots(*results: ParseResult) -> tuple[InputIdentity, ...]:
+    identities = tuple(result.input_identity for result in results)
+    if any(identity is None for identity in identities):
+        raise ConverterError("File commands require verified input snapshots")
+    return tuple(identity for identity in identities if identity is not None)
 
 
 def write_output_payload(
@@ -1063,9 +1144,15 @@ def write_output_payload(
 
 
 def atomic_write_bytes(
-    path: Path, data: bytes | BinaryIO, force: bool = False, *, expected_size: int | None = None
+    path: Path,
+    data: bytes | BinaryIO,
+    force: bool = False,
+    *,
+    expected_size: int | None = None,
+    protected_inputs: Sequence[InputIdentity] = (),
 ) -> Path:
     destination = ensure_output_path(path, force)
+    ensure_outputs_do_not_replace_inputs((destination,), protected_inputs)
     if os.name != "nt":
         directory = open_posix_directory(destination.parent)
         temporary_name = f".ids-{uuid.uuid4().hex}.tmp"
@@ -1091,6 +1178,7 @@ def atomic_write_bytes(
                 leaf = None
             if leaf is not None and not stat.S_ISREG(leaf.st_mode):
                 raise ConverterError("Output leaf must be a regular file")
+            refuse_input_leaf(leaf, protected_inputs)
             if force:
                 os.replace(
                     temporary_name, destination.name, src_dir_fd=directory, dst_dir_fd=directory
@@ -1128,6 +1216,11 @@ def atomic_write_bytes(
                     handle.flush()
                     os.fsync(handle.fileno())
                 if force:
+                    try:
+                        leaf = destination.stat()
+                    except FileNotFoundError:
+                        leaf = None
+                    refuse_input_leaf(leaf, protected_inputs)
                     os.replace(temporary, destination)
                 else:
                     try:
@@ -1139,8 +1232,12 @@ def atomic_write_bytes(
     return destination
 
 
-def atomic_write_text(path: Path, text: str, force: bool = False) -> Path:
-    return atomic_write_bytes(path, text.encode("utf-8"), force=force)
+def atomic_write_text(
+    path: Path, text: str, force: bool = False, *, protected_inputs: Sequence[InputIdentity] = ()
+) -> Path:
+    return atomic_write_bytes(
+        path, text.encode("utf-8"), force=force, protected_inputs=protected_inputs
+    )
 
 
 def json_text(value: Any) -> str:
@@ -1222,7 +1319,9 @@ def strip_rule_comments(text: str) -> str:
     return output.getvalue()
 
 
-def split_top_level(text: str, delimiter: str, *, max_parts: int | None = None) -> list[str]:
+def split_top_level(
+    text: str, delimiter: str, *, max_parts: int | None = None, respect_nesting: bool = True
+) -> list[str]:
     parts: list[str] = []
     start = 0
     quote = False
@@ -1248,7 +1347,7 @@ def split_top_level(text: str, delimiter: str, *, max_parts: int | None = None) 
             round_depth += 1
         elif char == ")" and round_depth:
             round_depth -= 1
-        elif char == delimiter and square == 0 and round_depth == 0:
+        elif char == delimiter and (not respect_nesting or (square == 0 and round_depth == 0)):
             parts.append(text[start:index])
             if max_parts is not None and len(parts) >= max_parts:
                 raise ConverterError("Rule option budget exceeded; declare a smaller rule")
@@ -1351,9 +1450,9 @@ def option_diagnostic(
 
 class RuleParser:
     def parse_file(self, path: Path) -> ParseResult:
-        text, size = read_utf8(path)
-        result = self.parse_text(text, str(path.resolve()), byte_count=size)
-        result.byte_count = size
+        text, identity = read_input(path)
+        result = self.parse_text(text, str(identity.path), byte_count=identity.byte_count)
+        result.input_identity = identity
         return result
 
     def parse_text(
@@ -1573,7 +1672,9 @@ class RuleParser:
                     index,
                 )
             )
-        option_parts = split_top_level(body, ";", max_parts=MAX_RULE_OPTIONS + 1)
+        option_parts = split_top_level(
+            body, ";", max_parts=MAX_RULE_OPTIONS + 1, respect_nesting=False
+        )
         if len(option_parts) > MAX_RULE_OPTIONS + 1:
             raise ConverterError("Rule option budget exceeded; declare a smaller rule")
         if body.strip() and option_parts[-1].strip():
@@ -1858,31 +1959,77 @@ def transform_snort2_to_snort3(options: Sequence[RuleOption]) -> list[RuleOption
     associated_buffers = set(associations.values())
     transformed: list[RuleOption] = []
     active_buffer = "pkt_data"
+    payload_buffer = "pkt_data"
+    # Generated selector restoration does not restore the source pattern cursor.
+    # Keep its buffer provenance across flow, metadata and other neutral options.
+    cursor_buffer = "pkt_data"
+    cursor_preserved = True
+    pattern_displaced = False
     for index, option in enumerate(options):
         if index in associated_buffers:
             continue
         if option.key == "content":
             buffer_index = associations.get(index)
-            desired = options[buffer_index].key if buffer_index is not None else "pkt_data"
+            desired = options[buffer_index].key if buffer_index is not None else payload_buffer
+            cursor = index + 1
+            relative_pattern = False
+            while cursor < len(options) and (
+                options[cursor].key in CONTENT_MODIFIERS or cursor == buffer_index
+            ):
+                relative_pattern |= options[cursor].key in {"distance", "within"}
+                cursor += 1
+            if relative_pattern and (cursor_buffer != desired or not cursor_preserved):
+                raise ConverterError(
+                    "Relative content after a backward Snort 2 content modifier cannot preserve its cursor"
+                )
             if desired != active_buffer:
                 transformed.append(RuleOption(desired, None, desired))
                 active_buffer = desired
+                cursor_preserved = False
             transformed.append(option)
+            pattern_displaced = False
+            if option.value is not None and not option.value.lstrip().startswith("!"):
+                cursor_buffer = desired
+                cursor_preserved = True
             continue
-        if option.key in {"file_data", "pkt_data", "raw_data"}:
+        if option.key in {"file_data", "pkt_data", "raw_data", "base64_data"}:
             transformed.append(option)
             active_buffer = option.key
+            payload_buffer = option.key
+            cursor_buffer = option.key
+            cursor_preserved = True
             continue
-        if option.key in {
-            "pcre",
-            "byte_extract",
-            "byte_jump",
-            "byte_math",
-            "byte_test",
-            "isdataat",
-        } and active_buffer not in {"pkt_data", "raw_data", "file_data"}:
-            transformed.append(RuleOption("pkt_data", None, "pkt_data"))
-            active_buffer = "pkt_data"
+        if pattern_displaced and option.key in DISPLACED_PATTERN_MODIFIERS:
+            raise ConverterError(
+                "Displaced pattern modifier after a backward Snort 2 content group cannot preserve its pattern"
+            )
+        # A backward modifier belongs only to its source content group. Restore
+        # before any subsequent non-modifier instead of listing payload consumers.
+        # Cursor-relative consumers cannot be moved safely between these buffers.
+        if option.key not in DISPLACED_PATTERN_MODIFIERS:
+            if (cursor_buffer != payload_buffer or not cursor_preserved) and (
+                (
+                    option.key == "pcre"
+                    and option.value is not None
+                    and "R" in pcre_flags(option.value)
+                )
+                or (
+                    (
+                        option.key.startswith("byte_")
+                        or option.key in {"isdataat", "base64_decode", "asn1", "bufferlen"}
+                    )
+                    and option.value is not None
+                    and re.search(r"\brelative(?:_offset)?\b", option.value.lower()) is not None
+                )
+            ):
+                raise ConverterError(
+                    "Relative payload operation after a backward Snort 2 content modifier cannot preserve its cursor"
+                )
+            if active_buffer != payload_buffer:
+                transformed.append(RuleOption(payload_buffer, None, payload_buffer))
+                active_buffer = payload_buffer
+                cursor_preserved = False
+                pattern_displaced = True
         transformed.append(option)
     return transformed
 
@@ -1991,9 +2138,60 @@ def mapped_suricata_stream_size(value: str) -> str | None:
     return f"{directions[snort_direction.lower() if snort_direction else None]},{suricata_operator},{number}"
 
 
+def mapped_suricata_bufferlen(value: str | None) -> str | None:
+    if value is None:
+        return None
+    # Accept the documented shared absolute numeric grammar only. This also
+    # rejects relative qualifiers regardless of tabs, newlines or other spacing.
+    match = re.fullmatch(r"\s*(<=|>=|[<>=])?\s*([0-9]+)\s*(?:<>\s*([0-9]+)\s*)?", value)
+    if match is None:
+        return None
+    operator, first, second = match.groups()
+    numbers = [number.lstrip("0") or "0" for number in (first, second) if number is not None]
+    if any(len(number) > 5 or int(number) > 65535 for number in numbers):
+        return None
+    if second is not None:
+        if operator is not None or int(numbers[0]) >= int(numbers[1]):
+            return None
+        return f"{int(numbers[0])}<>{int(numbers[1])}"
+    return (operator or "") + str(int(numbers[0]))
+
+
+def sip_relative_cursor_unsafe(options: Sequence[RuleOption]) -> bool:
+    if not any(option.key in SNORT_TO_SURICATA_OPTION for option in options):
+        return False
+    if any(
+        option.key in {"distance", "within"}
+        or (option.key == "pcre" and option.value is not None and "R" in pcre_flags(option.value))
+        or (
+            (
+                option.key.startswith("byte_")
+                or option.key in {"isdataat", "base64_decode", "asn1", "bufferlen"}
+            )
+            and option.value is not None
+            and re.search(r"\brelative(?:_offset)?\b", option.value.lower()) is not None
+        )
+        for option in options
+    ):
+        return True
+    shorthand_since_pattern = False
+    for option in options:
+        if option.key in SNORT_TO_SURICATA_OPTION:
+            shorthand_since_pattern = True
+        elif option.key in {"content", "pcre"}:
+            shorthand_since_pattern = False
+        elif shorthand_since_pattern and option.key in DISPLACED_PATTERN_MODIFIERS:
+            return True
+    return False
+
+
 def transform_to_suricata(
     options: Sequence[RuleOption], source_dialect: str, rule_protocol: str
 ) -> list[RuleOption]:
+    if sip_relative_cursor_unsafe(options):
+        raise ConverterError(
+            "SIP shorthand cannot preserve a relative payload cursor or displaced pattern modifier"
+        )
     if source_dialect == "snort2":
         options = transform_snort2_to_snort3(options)
         source_dialect = "snort3"
@@ -2002,6 +2200,7 @@ def transform_to_suricata(
         raise ConverterError("Rule asserts conflicting application protocols")
     implied_protocols = implied_suricata_protocols(options, rule_protocol, include_services=False)
     emitted_services: set[str] = set()
+    active_buffer = RuleOption("pkt_data", None, "pkt_data")
     index = 0
     while index < len(options):
         option = options[index]
@@ -2018,7 +2217,10 @@ def transform_to_suricata(
                     RuleOption("app-layer-protocol", service, option.raw, option.origin)
                 )
         elif key == "bufferlen":
-            transformed.append(RuleOption("bsize", option.value, option.raw, option.origin))
+            value = mapped_suricata_bufferlen(option.value)
+            if value is None:
+                raise ConverterError("bufferlen cannot safely map to Suricata bsize")
+            transformed.append(RuleOption("bsize", value, option.raw, option.origin))
         elif key == "tag" and option.value is not None:
             value = mapped_suricata_tag(option.value)
             if value is not None:
@@ -2055,6 +2257,7 @@ def transform_to_suricata(
             transformed.append(RuleOption("content", f'"{value}"', option.raw))
             if key == "sip_stat_code" and len(value) == 1:
                 transformed.append(RuleOption("startswith", None, "startswith"))
+            transformed.append(active_buffer)
         elif (
             source_dialect == "snort3"
             and key == "http_header"
@@ -2069,6 +2272,16 @@ def transform_to_suricata(
                 if mapped is not None
                 else option
             )
+        if key not in SNORT_TO_SURICATA_OPTION and transformed:
+            selected = transformed[-1]
+            if selected.key in DOTTED_TO_LEGACY_BUFFER or selected.key in {
+                "pkt_data",
+                "raw_data",
+                "file.data",
+                "file_data",
+                "base64_data",
+            }:
+                active_buffer = selected
         index += 1
     return transformed
 
@@ -2218,6 +2431,15 @@ def compatibility_diagnostics(
                     + ", ".join(packet_options),
                 )
             )
+        if sip_relative_cursor_unsafe(rule.options):
+            diagnostics.append(
+                option_diagnostic(
+                    rule,
+                    "error",
+                    "SIP_RELATIVE_CURSOR_UNSAFE",
+                    "SIP shorthand conversion cannot preserve relative payload cursors or displaced pattern modifiers",
+                )
+            )
     for option_index, option in enumerate(rule.options):
         key = option.key
         if target == "suricata" and key == "service":
@@ -2263,19 +2485,13 @@ def compatibility_diagnostics(
                 )
             )
         elif target == "suricata" and key == "bufferlen":
-            value = option.value or ""
-            if (
-                not value
-                or ",relative" in value.replace(" ", "").lower()
-                or "<=>" in value
-                or value.lstrip().startswith("!")
-            ):
+            if mapped_suricata_bufferlen(option.value) is None:
                 diagnostics.append(
                     option_diagnostic(
                         rule,
                         "error",
                         "UNSAFE_BUFFERLEN_MAPPING",
-                        "bufferlen can map to Suricata bsize only without relative, inclusive-range, or negated semantics",
+                        "bufferlen can map to Suricata bsize only for absolute 0..65535 comparisons or ascending exclusive ranges",
                         option.name,
                     )
                 )
@@ -2510,7 +2726,16 @@ def convert_rules(
         if any(item.severity == "error" for item in diagnostics):
             result.rejected_rule_indexes.append(rule.index)
             continue
-        result.rules.append(render_rule(rule, target, dialect))
+        try:
+            rendered = render_rule(rule, target, dialect)
+        except ConverterError as error:
+            extend_diagnostics(
+                result.diagnostics,
+                [option_diagnostic(rule, "error", "UNSAFE_RULE_TRANSFORMATION", str(error))],
+            )
+            result.rejected_rule_indexes.append(rule.index)
+            continue
+        result.rules.append(rendered)
     if result.unverified_keywords and not strict:
         if len(result.diagnostics) >= MAX_DIAGNOSTICS:
             raise ConverterError("Diagnostic budget exceeded; no partial output is safe")
@@ -3594,7 +3819,7 @@ def print_diagnostics(diagnostics: Sequence[Diagnostic], limit: int = 25) -> Non
 def command_validate(args: argparse.Namespace) -> int:
     parsed = RuleParser().parse_file(args.input)
     outputs = tuple(path for path in (args.json, args.sarif) if path is not None)
-    ensure_outputs_do_not_replace_inputs(outputs, (args.input,))
+    ensure_outputs_do_not_replace_inputs(outputs, input_snapshots(parsed))
     ensure_outputs_available(outputs, args.force)
     if args.json:
         payload = {
@@ -3606,9 +3831,19 @@ def command_validate(args: argparse.Namespace) -> int:
             "diagnostic_counts": diagnostic_counts(parsed.diagnostics),
             "diagnostics": [item.to_dict() for item in parsed.diagnostics],
         }
-        atomic_write_text(args.json, json_text(payload), force=args.force)
+        atomic_write_text(
+            args.json,
+            json_text(payload),
+            force=args.force,
+            protected_inputs=input_snapshots(parsed),
+        )
     if args.sarif:
-        atomic_write_text(args.sarif, json_text(sarif_report(parsed)), force=args.force)
+        atomic_write_text(
+            args.sarif,
+            json_text(sarif_report(parsed)),
+            force=args.force,
+            protected_inputs=input_snapshots(parsed),
+        )
     print(
         f"Validated {len(parsed.rules):,} rules. "
         + ", ".join(f"{k}: {v}" for k, v in diagnostic_counts(parsed.diagnostics).items())
@@ -3622,8 +3857,10 @@ def command_analyze(args: argparse.Namespace) -> int:
     report = ruleset_analysis(parsed)
     output = json_text(report)
     if args.output:
-        ensure_outputs_do_not_replace_inputs((args.output,), (args.input,))
-        destination = atomic_write_text(args.output, output, force=args.force)
+        ensure_outputs_do_not_replace_inputs((args.output,), input_snapshots(parsed))
+        destination = atomic_write_text(
+            args.output, output, force=args.force, protected_inputs=input_snapshots(parsed)
+        )
         print(f"Wrote analysis to {terminal_safe(destination)}")
     else:
         print(output, end="")
@@ -3652,7 +3889,7 @@ def command_convert(args: argparse.Namespace) -> int:
     requested_outputs = tuple(
         path for path in (args.output, args.report, args.rejected_output) if path is not None
     )
-    ensure_outputs_do_not_replace_inputs(requested_outputs, (args.input,))
+    ensure_outputs_do_not_replace_inputs(requested_outputs, input_snapshots(parsed))
     if parsed.errors:
         print_diagnostics(parsed.diagnostics)
         print(
@@ -3670,7 +3907,12 @@ def command_convert(args: argparse.Namespace) -> int:
             "rules": [rule_to_dict(rule) for rule in parsed.rules],
             "diagnostics": [item.to_dict() for item in parsed.diagnostics],
         }
-        atomic_write_text(args.output, json_text(payload), force=args.force)
+        atomic_write_text(
+            args.output,
+            json_text(payload),
+            force=args.force,
+            protected_inputs=input_snapshots(parsed),
+        )
         print(f"Exported {len(parsed.rules):,} rules to {terminal_safe(args.output)}")
         return EXIT_OK
     converted = convert_rules(
@@ -3720,7 +3962,12 @@ def command_convert(args: argparse.Namespace) -> int:
         )
     ensure_outputs_available(requested_outputs, args.force)
     if args.rejected_output and converted.rejected_rule_indexes:
-        atomic_write_text(args.rejected_output, rejected_text, force=args.force)
+        atomic_write_text(
+            args.rejected_output,
+            rejected_text,
+            force=args.force,
+            protected_inputs=input_snapshots(parsed),
+        )
     if args.report:
         report = {
             "schema_version": 1,
@@ -3737,8 +3984,18 @@ def command_convert(args: argparse.Namespace) -> int:
             "diagnostic_counts": diagnostic_counts(all_diagnostics),
             "diagnostics": [item.to_dict() for item in all_diagnostics],
         }
-        atomic_write_text(args.report, json_text(report), force=args.force)
-    atomic_write_text(args.output, "\n".join(output_lines), force=args.force)
+        atomic_write_text(
+            args.report,
+            json_text(report),
+            force=args.force,
+            protected_inputs=input_snapshots(parsed),
+        )
+    atomic_write_text(
+        args.output,
+        "\n".join(output_lines),
+        force=args.force,
+        protected_inputs=input_snapshots(parsed),
+    )
     print(
         f"Converted {len(converted.rules):,} rules to {args.target}: {terminal_safe(args.output)}"
     )
@@ -3749,6 +4006,13 @@ def command_convert(args: argparse.Namespace) -> int:
 def command_panorama(args: argparse.Namespace) -> int:
     parsed = RuleParser().parse_file(args.input)
     report, accepted, rejected, diagnostics = build_panorama_report(parsed)
+    if parsed.errors:
+        print_diagnostics(diagnostics)
+        print(
+            "Panorama generation stopped because the input contains parse errors. No output was written.",
+            file=sys.stderr,
+        )
+        return EXIT_FINDINGS
     output_dir = canonical_system_path(args.output_dir.expanduser().absolute())
     output_dir = ensure_output_directory(output_dir)
     files: list[tuple[Path, str]] = []
@@ -3807,7 +4071,7 @@ def command_panorama(args: argparse.Namespace) -> int:
             check_existing_generation(os.listdir(directory))
         finally:
             os.close(directory)
-    ensure_outputs_do_not_replace_inputs((path for path, _ in files), (args.input,))
+    ensure_outputs_do_not_replace_inputs((path for path, _ in files), input_snapshots(parsed))
     ensure_outputs_available((path for path, _ in files), args.force)
     files.sort(
         key=lambda item: (
@@ -3816,7 +4080,7 @@ def command_panorama(args: argparse.Namespace) -> int:
         )
     )
     for path, content in files:
-        atomic_write_text(path, content, force=args.force)
+        atomic_write_text(path, content, force=args.force, protected_inputs=input_snapshots(parsed))
     print(
         f"Panorama {PANORAMA_PROFILE} preflight: {len(accepted):,} accepted, {len(rejected):,} rejected, "
         f"{report['batch_count']:,} batches. Reports: {terminal_safe(output_dir)}"
@@ -3831,8 +4095,10 @@ def command_diff(args: argparse.Namespace) -> int:
     report = ruleset_diff(before, after)
     output = json_text(report)
     if args.output:
-        ensure_outputs_do_not_replace_inputs((args.output,), (args.before, args.after))
-        atomic_write_text(args.output, output, force=args.force)
+        ensure_outputs_do_not_replace_inputs((args.output,), input_snapshots(before, after))
+        atomic_write_text(
+            args.output, output, force=args.force, protected_inputs=input_snapshots(before, after)
+        )
         print(f"Wrote ruleset diff to {terminal_safe(args.output)}")
     else:
         print(output, end="")
