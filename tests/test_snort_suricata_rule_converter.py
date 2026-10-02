@@ -373,8 +373,10 @@ class FileAndArchiveSafetyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "output.txt"
 
-            def create_competing_file(_source: str, destination: str) -> None:
-                Path(destination).write_text("competitor", encoding="utf-8")
+            def create_competing_file(_source: str, destination: str, **_kwargs: object) -> None:
+                # Publication now uses directory-relative leaf names on POSIX.
+                # The competing writer still targets the same absolute output.
+                path.write_text("competitor", encoding="utf-8")
                 raise FileExistsError
 
             with (
