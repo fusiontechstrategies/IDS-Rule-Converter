@@ -32,7 +32,7 @@ from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, BinaryIO
 
 APP_NAME = "IDS Rule Converter"
 VERSION = "4.0.2"
@@ -571,8 +571,116 @@ def read_utf8(path: Path, max_bytes: int = MAX_INPUT_BYTES) -> tuple[str, int]:
         ) from exc
 
 
+def current_windows_sid():
+    identity = subprocess.run(  # noqa: S603 # nosec B603
+        [
+            str(Path(os.environ["SYSTEMROOT"]) / "System32" / "whoami.exe"),
+            "/user",
+            "/fo",
+            "csv",
+            "/nh",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    sid = next(csv.reader([identity.stdout.strip()]))[1]
+    if not re.fullmatch(r"S-1-[0-9-]+", sid):
+        raise ConverterError("Cannot resolve current user SID")
+    return sid
+
+
+def verify_windows_parent_security(handle, sid, require_user_owner=False):
+    """Read existing security by pinned handle. Never rewrite caller directories."""
+    import ctypes.wintypes
+
+    wintypes = ctypes.wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    security = ctypes.WinDLL("advapi32", use_last_error=True)
+    security.GetSecurityInfo.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    security.GetSecurityInfo.restype = wintypes.DWORD
+    security.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+    security.ConvertSidToStringSidW.restype = wintypes.BOOL
+    security.GetAclInformation.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.c_int,
+    ]
+    security.GetAclInformation.restype = wintypes.BOOL
+    security.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p)]
+    security.GetAce.restype = wintypes.BOOL
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel.LocalFree.restype = ctypes.c_void_p
+
+    def sid_text(value):
+        text = wintypes.LPWSTR()
+        if not value or not security.ConvertSidToStringSidW(value, ctypes.byref(text)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            return text.value
+        finally:
+            kernel.LocalFree(text)
+
+    trusted = {
+        sid,
+        "S-1-5-18",
+        "S-1-5-32-544",
+        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
+    }
+    owner, dacl, descriptor = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
+    error = security.GetSecurityInfo(
+        handle, 1, 5, ctypes.byref(owner), None, ctypes.byref(dacl), None, ctypes.byref(descriptor)
+    )
+    if error:
+        raise ctypes.WinError(error)
+    try:
+        actual_owner = sid_text(owner)
+        if actual_owner not in trusted or (require_user_owner and actual_owner != sid):
+            raise ConverterError("Output directory has an untrusted owner")
+        if not dacl.value:
+            raise ConverterError("Output directory has a NULL DACL")
+        info = (wintypes.DWORD * 3)()
+        if not security.GetAclInformation(dacl, ctypes.byref(info), ctypes.sizeof(info), 2):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if info[0] > 4096:
+            raise ConverterError("Output directory ACL exceeds its inspection budget")
+        # ADD_FILE or WRITE_ATTRIBUTES can authorize reparse-point retargeting
+        # after our handles close, including on an intermediate directory.
+        dangerous = 0x2 | 0x100 | 0x40 | 0x10000 | 0x40000 | 0x80000 | 0x10000000 | 0x40000000
+        if require_user_owner:
+            dangerous |= 0x2 | 0x4 | 0x10 | 0x100
+        for index in range(info[0]):
+            ace = ctypes.c_void_p()
+            if not security.GetAce(dacl, index, ctypes.byref(ace)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            header = (ctypes.c_ubyte * 4).from_address(ace.value)
+            if header[1] & 0x08:  # INHERIT_ONLY cannot authorize mutation of this directory.
+                continue
+            if header[0] == 1:  # Ignoring denies conservatively refuses ambiguous grants.
+                continue
+            if header[0] != 0 or int.from_bytes(bytes(header[2:4]), "little") < 12:
+                raise ConverterError("Unsupported output directory permission ACE")
+            mask = ctypes.c_uint32.from_address(ace.value + 4).value
+            if mask & dangerous and sid_text(ace.value + 8) not in trusted:
+                raise ConverterError("Output directory can be modified by another user")
+    finally:
+        kernel.LocalFree(descriptor)
+
+
 @contextmanager
-def windows_report_directory_lock(path, sid=None, remove_on_exit=False):
+def windows_report_directory_lock(
+    path, sid=None, remove_on_exit=False, *, parent_sid=None, require_user_owner=False
+):
     """Hold a non-reparse directory against replacement; set its DACL by handle."""
     if sys.platform != "win32":
         raise OSError("Windows report directory handles are unavailable on this platform")
@@ -608,7 +716,10 @@ def windows_report_directory_lock(path, sid=None, remove_on_exit=False):
     # LIST_DIRECTORY activates sharing checks; READ_ATTRIBUTES alone does not. Never share delete.
     handle = kernel.CreateFileW(
         str(path),
-        0x81 | (0x60000 if sid else 0) | (0x10000 if remove_on_exit else 0),
+        0x81
+        | (0x60000 if sid else 0)
+        | (0x20000 if parent_sid else 0)
+        | (0x10000 if remove_on_exit else 0),
         3,
         None,
         3,
@@ -626,6 +737,8 @@ def windows_report_directory_lock(path, sid=None, remove_on_exit=False):
             raise ctypes.WinError(ctypes.get_last_error())
         if not attributes[0] & 0x10 or attributes[0] & 0x400:
             raise PermissionError("Report directory must be a regular non-reparse directory")
+        if parent_sid:
+            verify_windows_parent_security(handle, parent_sid, require_user_owner)
         if sid:
             # A replaced staging pathname must not be adopted merely because
             # its DACL can be rewritten. Bind its owner before writing bytes.
@@ -799,6 +912,11 @@ def open_posix_directory(path: Path) -> int:
     descriptor = os.open(path.anchor, flags)
     try:
         for part in path.parts[1:]:
+            ancestor = os.fstat(descriptor)
+            if ancestor.st_uid not in {0, os.geteuid()} or (
+                stat.S_IMODE(ancestor.st_mode) & 0o022 and not ancestor.st_mode & stat.S_ISVTX
+            ):
+                raise ConverterError("Output ancestry can be replaced by another user")
             child = os.open(part, flags, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = child
@@ -815,20 +933,32 @@ def ensure_output_directory(path: Path, *, exclusive: bool = False) -> Path:
         raise ConverterError("Output directory cannot contain parent traversal")
     reject_parent_links(requested)
     if os.name == "nt":
+        sid = current_windows_sid()
         with ExitStack() as locks:
             current = Path(requested.anchor)
-            locks.enter_context(windows_report_directory_lock(current))
+            locks.enter_context(
+                windows_report_directory_lock(
+                    current, parent_sid=sid, require_user_owner=current == requested
+                )
+            )
             for index, part in enumerate(requested.parts[1:], 1):
                 current = current / part
                 last = index == len(requested.parts) - 1
                 if (exclusive and last) or not current.exists():
                     current.mkdir(mode=0o700)
-                locks.enter_context(windows_report_directory_lock(current))
+                locks.enter_context(
+                    windows_report_directory_lock(current, parent_sid=sid, require_user_owner=last)
+                )
     else:
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         descriptor = os.open(requested.anchor, flags)
         try:
             for index, part in enumerate(requested.parts[1:], 1):
+                ancestor = os.fstat(descriptor)
+                if ancestor.st_uid not in {0, os.geteuid()} or (
+                    stat.S_IMODE(ancestor.st_mode) & 0o022 and not ancestor.st_mode & stat.S_ISVTX
+                ):
+                    raise ConverterError("Output ancestry can be replaced by another user")
                 last = index == len(requested.parts) - 1
                 if exclusive and last:
                     os.mkdir(part, 0o700, dir_fd=descriptor)
@@ -883,7 +1013,30 @@ def ensure_outputs_do_not_replace_inputs(outputs: Iterable[Path], inputs: Iterab
             raise ConverterError(f"Output path would replace an input file: {resolved}")
 
 
-def atomic_write_bytes(path: Path, data: bytes, force: bool = False) -> Path:
+def write_output_payload(
+    handle: BinaryIO, data: bytes | BinaryIO, expected_size: int | None
+) -> None:
+    """Stream decoded archive bytes under independent size and declaration checks."""
+    if isinstance(data, bytes):
+        if expected_size is not None and len(data) != expected_size:
+            raise ConverterError("Archive entry length differs from its declaration")
+        handle.write(data)
+        return
+    total = 0
+    while chunk := data.read(64 * 1024):
+        total += len(chunk)
+        if total > MAX_EXTRACTED_FILE_BYTES or (
+            expected_size is not None and total > expected_size
+        ):
+            raise ConverterError("Decoded archive entry exceeds its byte budget")
+        handle.write(chunk)
+    if expected_size is not None and total != expected_size:
+        raise ConverterError("Archive entry length differs from its declaration")
+
+
+def atomic_write_bytes(
+    path: Path, data: bytes | BinaryIO, force: bool = False, *, expected_size: int | None = None
+) -> Path:
     destination = ensure_output_path(path, force)
     if os.name != "nt":
         directory = open_posix_directory(destination.parent)
@@ -901,7 +1054,7 @@ def atomic_write_bytes(path: Path, data: bytes, force: bool = False) -> Path:
                 dir_fd=directory,
             )
             with os.fdopen(fd, "wb") as handle:
-                handle.write(data)
+                write_output_payload(handle, data, expected_size)
                 handle.flush()
                 os.fsync(handle.fileno())
             try:
@@ -930,30 +1083,20 @@ def atomic_write_bytes(path: Path, data: bytes, force: bool = False) -> Path:
                 os.unlink(temporary_name, dir_fd=directory)
             os.close(directory)
         return destination
+    sid = current_windows_sid()
     with ExitStack() as locks:
         for parent in reversed((destination.parent, *destination.parent.parents)):
-            locks.enter_context(windows_report_directory_lock(parent))
-        identity = subprocess.run(  # noqa: S603 # nosec B603
-            [
-                str(Path(os.environ["SYSTEMROOT"]) / "System32" / "whoami.exe"),
-                "/user",
-                "/fo",
-                "csv",
-                "/nh",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        sid = next(csv.reader([identity.stdout.strip()]))[1]
-        if not re.fullmatch(r"S-1-[0-9-]+", sid):
-            raise ConverterError("Cannot resolve current user SID")
+            locks.enter_context(
+                windows_report_directory_lock(
+                    parent, parent_sid=sid, require_user_owner=parent == destination.parent
+                )
+            )
         staging = windows_private_report_directory(destination.parent, sid)
         with windows_report_directory_lock(staging, sid, remove_on_exit=True):
             temporary = staging / "report"
             try:
                 with temporary.open("xb") as handle:
-                    handle.write(data)
+                    write_output_payload(handle, data, expected_size)
                     handle.flush()
                     os.fsync(handle.fileno())
                 if force:
@@ -1752,7 +1895,9 @@ def mapped_suricata_service(value: str) -> str | None:
     return mapped if mapped in SURICATA_APP_PROTOCOLS else None
 
 
-def implied_suricata_protocols(options: Sequence[RuleOption], rule_protocol: str) -> set[str]:
+def implied_suricata_protocols(
+    options: Sequence[RuleOption], rule_protocol: str, *, include_services: bool = True
+) -> set[str]:
     """Return application protocols already asserted by headers or keywords."""
     protocols: set[str] = set()
     header_protocol = SNORT_SERVICE_TO_SURICATA.get(rule_protocol, rule_protocol)
@@ -1761,6 +1906,10 @@ def implied_suricata_protocols(options: Sequence[RuleOption], rule_protocol: str
     for option in options:
         key = option.key
         if key == "service":
+            if include_services and option.value is not None:
+                mapped = mapped_suricata_service(option.value)
+                if mapped is not None:
+                    protocols.add(mapped)
             continue
         if key == "app-layer-protocol" and option.value is not None:
             value = unquote(option.value).strip().lower()
@@ -1821,14 +1970,22 @@ def transform_to_suricata(
         options = transform_snort2_to_snort3(options)
         source_dialect = "snort3"
     transformed: list[RuleOption] = []
-    implied_protocols = implied_suricata_protocols(options, rule_protocol)
+    if len(implied_suricata_protocols(options, rule_protocol)) > 1:
+        raise ConverterError("Rule asserts conflicting application protocols")
+    implied_protocols = implied_suricata_protocols(options, rule_protocol, include_services=False)
+    emitted_services: set[str] = set()
     index = 0
     while index < len(options):
         option = options[index]
         key = option.key
         if key == "service" and option.value is not None:
             service = mapped_suricata_service(option.value)
-            if service is not None and service not in implied_protocols:
+            if (
+                service is not None
+                and service not in implied_protocols
+                and service not in emitted_services
+            ):
+                emitted_services.add(service)
                 transformed.append(
                     RuleOption("app-layer-protocol", service, option.raw, option.origin)
                 )
@@ -3201,6 +3358,8 @@ def validate_zip_archive(data: bytes) -> list[zipfile.ZipInfo]:
         if normalized in normalized_names:
             raise ConverterError(f"Archive contains duplicate paths: {member.filename!r}")
         normalized_names.add(normalized)
+        if member.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}:
+            raise ConverterError("ZIP entry uses an unsupported parameterized decoder")
         if member.flag_bits & 0x1:
             raise ConverterError(f"Archive contains an encrypted entry: {member.filename!r}")
         unix_mode = (member.external_attr >> 16) & 0xFFFF
@@ -3248,7 +3407,10 @@ def extract_archive(data: bytes, archive_type: str, output_dir: Path, force: boo
                 extracted = archive.extractfile(member)
                 if extracted is None:
                     raise ConverterError(f"Cannot read archive entry: {member.name!r}")
-                atomic_write_bytes(destination, extracted.read(), force=force)
+                with extracted:
+                    atomic_write_bytes(
+                        destination, extracted, force=force, expected_size=member.size
+                    )
                 written.append(destination)
     elif archive_type == "zip":
         members = validate_zip_archive(data)
@@ -3266,7 +3428,10 @@ def extract_archive(data: bytes, archive_type: str, output_dir: Path, force: boo
                 if member.is_dir():
                     ensure_output_directory(destination)
                     continue
-                atomic_write_bytes(destination, archive.read(member), force=force)
+                with archive.open(member) as content:
+                    atomic_write_bytes(
+                        destination, content, force=force, expected_size=member.file_size
+                    )
                 written.append(destination)
     else:
         raise ConverterError(f"Unsupported archive type: {archive_type}")
@@ -3581,9 +3746,47 @@ def command_panorama(args: argparse.Namespace) -> int:
             (output_dir / "panorama_preflight.txt", report_as_text(report)),
         )
     )
+    manifest_path = output_dir / "panorama_manifest.json"
+    manifest = {
+        "generation_id": uuid.uuid4().hex,
+        "sha256": {
+            path.name: hashlib.sha256(content.encode("utf-8")).hexdigest()
+            for path, content in files
+        },
+    }
+    files.append((manifest_path, json_text(manifest)))
+    expected_names = {path.name for path, _ in files}
+
+    def check_existing_generation(names):
+        for name in names:
+            if (
+                re.fullmatch(
+                    r"panorama_(?:batch_[0-9]+\.rules|rejected\.rules|preflight\.(?:json|txt)|manifest\.json)",
+                    name,
+                )
+                and name not in expected_names
+            ):
+                raise ConverterError(
+                    "Output directory contains stale Panorama artifacts; choose a fresh directory"
+                )
+
+    if os.name == "nt":
+        with windows_report_directory_lock(output_dir):
+            check_existing_generation(path.name for path in output_dir.iterdir())
+    else:
+        directory = open_posix_directory(output_dir)
+        try:
+            check_existing_generation(os.listdir(directory))
+        finally:
+            os.close(directory)
     ensure_outputs_do_not_replace_inputs((path for path, _ in files), (args.input,))
     ensure_outputs_available((path for path, _ in files), args.force)
-    files.sort(key=lambda item: item[0].name.startswith("panorama_batch_"))
+    files.sort(
+        key=lambda item: (
+            item[0].name == "panorama_manifest.json",
+            item[0].name.startswith("panorama_batch_"),
+        )
+    )
     for path, content in files:
         atomic_write_text(path, content, force=args.force)
     print(

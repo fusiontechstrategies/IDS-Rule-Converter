@@ -160,6 +160,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          python -I scripts/verify_release_integrity.py tag "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$RELEASE_COMMIT"
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --target "$RELEASE_COMMIT" --title "IDS Rule Converter $RELEASE_VERSION" --notes-file ".github/release-notes/$GITHUB_REF_NAME.md" dist/*
           if ! python -I scripts/verify_release_integrity.py tag "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$RELEASE_COMMIT"; then
             gh release delete "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --yes

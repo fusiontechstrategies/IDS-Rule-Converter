@@ -66,3 +66,12 @@ commit validation remain necessary; releases stay drafts for explicit approval.
 - Findings that require disabling documented safety controls
 - Social engineering, denial of service against maintainers, or destructive
   testing
+# Output and release boundaries
+
+Reports and extracted rules require a trusted output path. On Windows, the converter reads the owner and DACL through retained directory handles and refuses other principals' mutation rights in the caller's directory or ancestry. It never rewrites existing caller directory permissions. SYSTEM, Administrators and TrustedInstaller are part of the local operating-system trust boundary. Unsupported permission ACEs are refused conservatively; a deny ACE does not cancel an otherwise unsafe allow in this inspection. Shared writable locations can therefore be rejected even when an individual output file has a private DACL.
+
+POSIX output paths reject unsafe, non-sticky writable ancestors as well as unsafe leaves. Protected sticky temporary directories remain supported. ZIP rule feeds accept stored or deflated entries only, and extraction independently bounds streamed decoded bytes and their declared lengths.
+
+Panorama runs refuse a reused directory with recognized artifacts outside the new generation, including old higher-numbered batches or a stale rejected-rules file. Choose a fresh output directory. The manifest is published last and binds every current report and rules batch with SHA-256; consumers must verify that manifest before using a generation.
+
+Distribution verification limits compressed bytes, expanded bytes, member sizes, counts and metadata before materialization. ZIP64 wheels are refused, including locators preceding maximum-length end-record comments. PyPI publication uses a captured, signed protected-main verification revision and requires the protected-main deployment environment. Tag race closure additionally depends on the active GitHub rule preventing updates and deletion of version tags without bypass actors. Sequential API checks alone are not an atomic authorization boundary.
