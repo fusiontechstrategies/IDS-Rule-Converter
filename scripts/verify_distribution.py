@@ -9,11 +9,16 @@ import email
 import hashlib
 import io
 import tarfile
+import unicodedata
 import zipfile
+from collections import Counter
 from pathlib import Path, PurePosixPath
 
 MODULE = "snort_suricata_rule_converter.py"
 BLOCKED_SUFFIXES = {".env", ".key", ".p12", ".pem", ".pfx", ".pyc"}
+WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL"} | {
+    f"{prefix}{index}" for prefix in ("COM", "LPT") for index in range(1, 10)
+}
 
 
 def validate_record(values: dict[str, bytes], record: str) -> None:
@@ -39,7 +44,41 @@ def validate_record(values: dict[str, bytes], record: str) -> None:
             raise ValueError("Wheel RECORD identity differs from the verified member")
 
 
-def validate_metadata(metadata) -> None:
+def reviewed_project(source_root: Path) -> dict:
+    # Release jobs run Python 3.12 in isolated mode. Python 3.10 test/build users
+    # install the pinned tomli compatibility parser, never tagged import paths.
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        import tomli as tomllib
+    with (source_root / "pyproject.toml").open("rb") as stream:
+        return tomllib.load(stream)
+
+
+def validate_descriptive_metadata(metadata, source_root: Path, configuration: dict) -> None:
+    project = configuration["project"]
+    authors = project["authors"]
+    if any(set(author) != {"name"} for author in authors):
+        raise ValueError("Reviewed author format is unsupported")
+    expected = {
+        "Summary": [project["description"]],
+        "Author": [", ".join(author["name"] for author in authors)],
+        "Project-URL": [f"{label}, {url}" for label, url in project["urls"].items()],
+        "Classifier": project["classifiers"],
+    }
+    for header, values in expected.items():
+        if Counter(metadata.get_all(header) or []) != Counter(values):
+            raise ValueError(f"Package {header} differs from reviewed project metadata")
+    if project["readme"] != "README.md":
+        raise ValueError("Reviewed package description source is unsupported")
+    description = metadata.get_payload(decode=True)
+    if description is None or description.decode("utf-8").replace("\r\n", "\n") != (
+        source_root / "README.md"
+    ).read_text(encoding="utf-8"):
+        raise ValueError("Package description differs from reviewed README")
+
+
+def validate_metadata(metadata, source_root: Path, configuration: dict) -> None:
     allowed = {
         "Metadata-Version",
         "Name",
@@ -70,15 +109,28 @@ def validate_metadata(metadata) -> None:
         raise ValueError("Package metadata declares unreviewed dynamic fields")
     if len(metadata.get_all("Name") or []) != 1 or len(metadata.get_all("Version") or []) != 1:
         raise ValueError("Package metadata identity must be unique")
+    validate_descriptive_metadata(metadata, source_root, configuration)
 
 
 def safe_names(names: list[str]) -> None:
     seen: set[str] = set()
     for name in names:
         path = PurePosixPath(name)
-        if name.startswith("/") or "\\" in name or not path.parts or ".." in path.parts:
+        parts = name.removesuffix("/").split("/")
+        if (
+            name.startswith("/")
+            or "\\" in name
+            or not path.parts
+            or any(part in {"", ".", ".."} for part in parts)
+            or any(
+                part.endswith((" ", "."))
+                or part.split(".", 1)[0].upper() in WINDOWS_RESERVED_NAMES
+                or any(ord(char) < 32 or ord(char) == 127 or char in '<>:"|?*' for char in part)
+                for part in parts
+            )
+        ):
             raise ValueError(f"Unsafe archive path: {name}")
-        portable = name.rstrip("/").casefold()
+        portable = unicodedata.normalize("NFC", name.rstrip("/")).casefold()
         if portable in seen:
             raise ValueError(f"Duplicate archive path: {name}")
         seen.add(portable)
@@ -89,6 +141,7 @@ def safe_names(names: list[str]) -> None:
 
 
 def verify_distribution(dist_dir: Path, source_root: Path, version: str) -> tuple[Path, Path]:
+    configuration = reviewed_project(source_root)
     wheel_name = f"ids_rule_converter-{version}-py3-none-any.whl"
     sdist_name = f"ids_rule_converter-{version}.tar.gz"
     if {path.name for path in dist_dir.iterdir()} != {wheel_name, sdist_name}:
@@ -125,6 +178,15 @@ def verify_distribution(dist_dir: Path, source_root: Path, version: str) -> tupl
                 )
         if set(wheel_metadata.keys()) != {"Wheel-Version", "Generator", "Root-Is-Purelib", "Tag"}:
             raise ValueError("Wheel contains unreviewed installation headers")
+        generator_versions = [
+            requirement.split("==", 1)[1]
+            for requirement in configuration["build-system"]["requires"]
+            if requirement.startswith("setuptools==")
+        ]
+        if len(generator_versions) != 1 or wheel_metadata.get_all("Generator") != [
+            f"setuptools ({generator_versions[0]})"
+        ]:
+            raise ValueError("Wheel generator differs from reviewed build system")
         if values[prefix + "top_level.txt"].strip() != MODULE.removesuffix(".py").encode():
             raise ValueError("Wheel top-level module differs from reviewed source")
         if values[prefix + "licenses/LICENSE"] != (source_root / "LICENSE").read_bytes():
@@ -138,7 +200,7 @@ def verify_distribution(dist_dir: Path, source_root: Path, version: str) -> tupl
         if len(metadata) != 1 or len(entry_points) != 1:
             raise ValueError("Wheel is missing unique package metadata or CLI entry point")
         details = email.message_from_bytes(archive.read(metadata[0]))
-        validate_metadata(details)
+        validate_metadata(details, source_root, configuration)
         if details.get("Name") != "ids-rule-converter" or details.get("Version") != version:
             raise ValueError("Wheel package identity differs from release")
         if details.get_all("Requires-Dist"):
@@ -176,6 +238,16 @@ def verify_distribution(dist_dir: Path, source_root: Path, version: str) -> tupl
         }
         if actual != reviewed | generated:
             raise ValueError("Source archive contains missing or unreviewed installation members")
+        allowed_directories = {f"ids_rule_converter-{version}"}
+        for relative in reviewed | generated:
+            path = PurePosixPath(f"ids_rule_converter-{version}/{relative}")
+            allowed_directories.update(str(parent) for parent in path.parents if str(parent) != ".")
+        if any(
+            member.name.rstrip("/") not in allowed_directories
+            for member in members
+            if member.isdir()
+        ):
+            raise ValueError("Source archive contains unreviewed directories")
         prefix = f"ids_rule_converter-{version}/ids_rule_converter.egg-info/"
         sources = archive.extractfile(prefix + "SOURCES.txt").read().decode("utf-8").splitlines()
         if len(sources) != len(set(sources)) or set(sources) != reviewed | (
@@ -200,7 +272,7 @@ def verify_distribution(dist_dir: Path, source_root: Path, version: str) -> tupl
             metadata = email.message_from_bytes(
                 archive.extractfile(f"ids_rule_converter-{version}/{relative}").read()
             )
-            validate_metadata(metadata)
+            validate_metadata(metadata, source_root, configuration)
             if (
                 metadata.get("Name") != "ids-rule-converter"
                 or metadata.get("Version") != version
@@ -229,8 +301,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("dist_dir", type=Path)
     parser.add_argument("--version", required=True)
+    parser.add_argument("--source-root", type=Path)
     arguments = parser.parse_args()
-    root = Path(__file__).resolve().parents[1]
+    root = (
+        arguments.source_root.resolve()
+        if arguments.source_root
+        else Path(__file__).resolve().parents[1]
+    )
     wheel, sdist = verify_distribution(arguments.dist_dir.resolve(), root, arguments.version)
     print(f"Verified {wheel.name} and {sdist.name}")
 

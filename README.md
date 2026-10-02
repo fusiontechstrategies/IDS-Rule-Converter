@@ -103,6 +103,29 @@ See [QUICK_REFERENCE.md](QUICK_REFERENCE.md) for copy-ready examples.
 
 ## Conversion safety model
 
+Auto detection rejects legacy buffer placement when the same text can mean a
+Snort 2 backward content modifier or a Snort 3 forward sticky buffer. Use
+`--source-dialect snort2` or `--source-dialect snort3` after identifying the
+source engine. The tool does not guess which payload or HTTP buffer a pattern
+should inspect. Panorama preflight also rejects these ambiguous rules.
+
+Processing is bounded to 128 MiB per input, 1 MiB per rule, 256 options per
+rule, 100,000 parsed rules, 1,000,000 total options, and 10,000 diagnostics.
+Exceeding any parser budget aborts the operation, including with
+`--allow-partial`, so a truncated prefix cannot be mistaken for a complete
+ruleset. Archive object limits include implicit directories, with at most
+32 path components. Console and text reports escape embedded control
+characters; JSON retains the original values for review. Fingerprints preserve
+content and PCRE literal whitespace rather than collapsing it.
+
+Release verification binds package descriptions, authors, project URLs,
+classifiers, README content, and the wheel generator to the reviewed source.
+Source archives reject unreviewed empty directories and nonportable paths.
+PyPI promotion verifies the copied distribution hashes and rechecks the tag,
+signed commit, main ancestry, and public stable release after environment
+approval. Python 3.10 development checks use the pinned `tomli` compatibility
+parser; the runtime CLI still uses only the standard library.
+
 The default behavior is intentionally conservative:
 
 1. The complete input must parse successfully.

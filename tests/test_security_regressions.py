@@ -157,7 +157,9 @@ class SecurityRegressions(unittest.TestCase):
             "License-Expression: Apache-2.0\nLicense-File: LICENSE\nProvides-Extra: unreviewed\n"
         )
         with self.assertRaisesRegex(ValueError, "unreviewed installation semantics"):
-            verify_distribution.validate_metadata(metadata)
+            verify_distribution.validate_metadata(
+                metadata, ROOT, verify_distribution.reviewed_project(ROOT)
+            )
 
     @unittest.skipIf(os.name == "nt", "POSIX link semantics")
     def test_intermediate_output_parent_link_is_rejected(self):
@@ -298,16 +300,23 @@ class SecurityRegressions(unittest.TestCase):
         version = "4.0.2"
         wheel = directory / f"ids_rule_converter-{version}-py3-none-any.whl"
         sdist = directory / f"ids_rule_converter-{version}.tar.gz"
-        metadata = (
-            f"Metadata-Version: 2.4\nName: ids-rule-converter\nVersion: {version}\nRequires-Python: <3.15,>=3.10\nDescription-Content-Type: text/markdown\nLicense-Expression: Apache-2.0\nLicense-File: LICENSE\n"
-        ).encode()
+        metadata = f"Metadata-Version: 2.4\nName: ids-rule-converter\nVersion: {version}\nRequires-Python: <3.15,>=3.10\nDescription-Content-Type: text/markdown\nLicense-Expression: Apache-2.0\nLicense-File: LICENSE\n"
+        project = verify_distribution.reviewed_project(ROOT)["project"]
+        metadata += f"Summary: {project['description']}\nAuthor: {project['authors'][0]['name']}\n"
+        metadata += "".join(
+            f"Project-URL: {label}, {url}\n" for label, url in project["urls"].items()
+        )
+        metadata += "".join(f"Classifier: {value}\n" for value in project["classifiers"])
+        metadata = (metadata + "\n" + (ROOT / "README.md").read_text(encoding="utf-8")).encode(
+            "utf-8"
+        )
         entry = b"[console_scripts]\nids-rule-converter = snort_suricata_rule_converter:main\n"
         prefix = f"ids_rule_converter-{version}.dist-info/"
         values = {
             verify_distribution.MODULE: (ROOT / verify_distribution.MODULE).read_bytes(),
             prefix + "METADATA": metadata,
             prefix
-            + "WHEEL": b"Wheel-Version: 1.0\nGenerator: synthetic\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+            + "WHEEL": b"Wheel-Version: 1.0\nGenerator: setuptools (84.0.0)\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
             prefix + "entry_points.txt": entry,
             prefix + "top_level.txt": b"snort_suricata_rule_converter\n",
             prefix + "licenses/LICENSE": (ROOT / "LICENSE").read_bytes(),

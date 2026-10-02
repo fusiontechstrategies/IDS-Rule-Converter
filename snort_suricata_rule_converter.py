@@ -44,6 +44,11 @@ EXIT_FINDINGS = 2
 
 MAX_INPUT_BYTES = 128 * 1024 * 1024
 MAX_RULE_CHARS = 1 * 1024 * 1024
+MAX_RULE_OPTIONS = 256
+MAX_PARSED_RULES = 100_000
+MAX_TOTAL_OPTIONS = 1_000_000
+MAX_DIAGNOSTICS = 10_000
+MAX_ARCHIVE_PATH_DEPTH = 32
 MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 20_000
 MAX_EXTRACTED_BYTES = 512 * 1024 * 1024
@@ -550,7 +555,10 @@ def read_utf8(path: Path, max_bytes: int = MAX_INPUT_BYTES) -> tuple[str, int]:
     if size > max_bytes:
         raise ConverterError(f"Input is {size:,} bytes; the limit is {max_bytes:,} bytes")
     try:
-        data = resolved.read_bytes()
+        with resolved.open("rb") as stream:
+            data = stream.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise ConverterError(f"Input exceeds the {max_bytes:,} byte limit while reading")
     except OSError as exc:
         raise ConverterError(f"Cannot read input file '{resolved}': {exc}") from exc
     if b"\x00" in data:
@@ -597,10 +605,10 @@ def windows_report_directory_lock(path, sid=None, remove_on_exit=False):
     kernel.GetFileInformationByHandleEx.restype = wintypes.BOOL
     kernel.LocalFree.argtypes = [ctypes.c_void_p]
     kernel.LocalFree.restype = ctypes.c_void_p
-    # READ_ATTRIBUTES, optionally READ_CONTROL/WRITE_DAC/DELETE. Never share delete.
+    # LIST_DIRECTORY activates sharing checks; READ_ATTRIBUTES alone does not. Never share delete.
     handle = kernel.CreateFileW(
         str(path),
-        0x80 | (0x60000 if sid else 0) | (0x10000 if remove_on_exit else 0),
+        0x81 | (0x60000 if sid else 0) | (0x10000 if remove_on_exit else 0),
         3,
         None,
         3,
@@ -800,11 +808,45 @@ def open_posix_directory(path: Path) -> int:
         raise
 
 
+def ensure_output_directory(path: Path, *, exclusive: bool = False) -> Path:
+    """Create components while their actual parents are pinned, never through links."""
+    requested = canonical_system_path(path.expanduser().absolute())
+    if ".." in requested.parts:
+        raise ConverterError("Output directory cannot contain parent traversal")
+    reject_parent_links(requested)
+    if os.name == "nt":
+        with ExitStack() as locks:
+            current = Path(requested.anchor)
+            locks.enter_context(windows_report_directory_lock(current))
+            for index, part in enumerate(requested.parts[1:], 1):
+                current = current / part
+                last = index == len(requested.parts) - 1
+                if (exclusive and last) or not current.exists():
+                    current.mkdir(mode=0o700)
+                locks.enter_context(windows_report_directory_lock(current))
+    else:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        descriptor = os.open(requested.anchor, flags)
+        try:
+            for index, part in enumerate(requested.parts[1:], 1):
+                last = index == len(requested.parts) - 1
+                if exclusive and last:
+                    os.mkdir(part, 0o700, dir_fd=descriptor)
+                try:
+                    child = os.open(part, flags, dir_fd=descriptor)
+                except FileNotFoundError:
+                    os.mkdir(part, 0o700, dir_fd=descriptor)
+                    child = os.open(part, flags, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = child
+        finally:
+            os.close(descriptor)
+    return requested
+
+
 def ensure_output_path(path: Path, force: bool) -> Path:
     requested = canonical_system_path(path.expanduser().absolute())
-    resolved_parent = requested.parent
-    reject_parent_links(resolved_parent)
-    resolved_parent.mkdir(parents=True, exist_ok=True)
+    resolved_parent = ensure_output_directory(requested.parent)
     resolved = resolved_parent / requested.name
     if resolved.is_symlink() or (
         resolved.exists()
@@ -936,7 +978,7 @@ def json_text(value: Any) -> str:
 
 def strip_rule_comments(text: str) -> str:
     """Remove # and C-style comments while preserving strings and newlines."""
-    output: list[str] = []
+    output = io.StringIO()
     quote = False
     escaped = False
     line_comment = False
@@ -954,26 +996,26 @@ def strip_rule_comments(text: str) -> str:
             if char == "\n":
                 line_comment = False
                 line_has_nonspace = False
-                output.append("\n")
+                output.write("\n")
             else:
-                output.append(" ")
+                output.write(" ")
             index += 1
             continue
         if block_comment:
             if char == "*" and next_char == "/":
-                output.extend((" ", " "))
+                output.write("  ")
                 block_comment = False
                 index += 2
                 continue
             if char == "\n":
                 line_has_nonspace = False
-                output.append("\n")
+                output.write("\n")
             else:
-                output.append(" ")
+                output.write(" ")
             index += 1
             continue
         if quote:
-            output.append(char)
+            output.write(char)
             if escaped:
                 escaped = False
             elif char == "\\":
@@ -984,21 +1026,21 @@ def strip_rule_comments(text: str) -> str:
             continue
         if char == '"':
             quote = True
-            output.append(char)
+            output.write(char)
             index += 1
             continue
         if char == "#" and not line_has_nonspace:
             line_comment = True
-            output.append(" ")
+            output.write(" ")
             index += 1
             continue
         if char == "/" and next_char == "*":
             block_comment = True
             block_start_line = line
-            output.extend((" ", " "))
+            output.write("  ")
             index += 2
             continue
-        output.append(char)
+        output.write(char)
         if char == "\n":
             line_has_nonspace = False
         elif not char.isspace():
@@ -1006,7 +1048,7 @@ def strip_rule_comments(text: str) -> str:
         index += 1
     if block_comment:
         raise UnterminatedBlockComment(block_start_line)
-    return "".join(output)
+    return output.getvalue()
 
 
 def split_top_level(text: str, delimiter: str) -> list[str]:
@@ -1112,12 +1154,19 @@ def option_diagnostic(
 class RuleParser:
     def parse_file(self, path: Path) -> ParseResult:
         text, size = read_utf8(path)
-        result = self.parse_text(text, str(path.resolve()))
+        result = self.parse_text(text, str(path.resolve()), byte_count=size)
         result.byte_count = size
         return result
 
-    def parse_text(self, text: str, source: str = "<memory>") -> ParseResult:
-        result = ParseResult(source=source, byte_count=len(text.encode("utf-8")))
+    def parse_text(
+        self, text: str, source: str = "<memory>", *, byte_count: int | None = None
+    ) -> ParseResult:
+        if len(text) > MAX_INPUT_BYTES:
+            raise ConverterError("Input exceeds its character budget")
+        size = len(text.encode("utf-8")) if byte_count is None else byte_count
+        if size > MAX_INPUT_BYTES:
+            raise ConverterError("Input exceeds its byte budget")
+        result = ParseResult(source=source, byte_count=size)
         try:
             cleaned = strip_rule_comments(text)
         except UnterminatedBlockComment as exc:
@@ -1127,12 +1176,22 @@ class RuleParser:
                 )
             )
             return result
+        total_options = 0
         for record_index, (raw, start_line, end_line) in enumerate(
             self._records(cleaned, result), 1
         ):
+            if record_index > MAX_PARSED_RULES:
+                raise ConverterError("Parser rule count budget exceeded; no partial output is safe")
             rule, diagnostics = self._parse_record(raw, source, start_line, end_line, record_index)
             result.diagnostics.extend(diagnostics)
+            if len(result.diagnostics) > MAX_DIAGNOSTICS:
+                raise ConverterError("Parser diagnostic budget exceeded; no partial output is safe")
             if rule is not None:
+                total_options += len(rule.options)
+                if total_options > MAX_TOTAL_OPTIONS:
+                    raise ConverterError(
+                        "Parser total option budget exceeded; no partial output is safe"
+                    )
                 result.rules.append(rule)
         return result
 
@@ -1141,6 +1200,8 @@ class RuleParser:
         line = 1
         length = len(text)
         while index < length:
+            if len(result.diagnostics) >= MAX_DIAGNOSTICS:
+                raise ConverterError("Parser diagnostic budget exceeded; no partial output is safe")
             while index < length and text[index].isspace():
                 if text[index] == "\n":
                     line += 1
@@ -1152,9 +1213,13 @@ class RuleParser:
                 line_end = length
             token_match = re.match(r"[A-Za-z_][A-Za-z0-9_-]*", text[index:line_end])
             token = token_match.group(0).lower() if token_match else ""
-            if token not in RULE_ACTIONS:
+            header_preview = text[index : min(line_end, index + 512)]
+            looks_like_rule = ("->" in header_preview or "<>" in header_preview) or (
+                "(" in header_preview and len(split_header(header_preview.split("(", 1)[0])) == 2
+            )
+            if token not in RULE_ACTIONS and not looks_like_rule:
                 result.ignored_directives += 1
-                preview = " ".join(text[index:line_end].strip().split())
+                preview = " ".join(text[index : min(line_end, index + 160)].strip().split())
                 if preview:
                     if len(preview) > 120:
                         preview = preview[:117] + "..."
@@ -1300,6 +1365,8 @@ class RuleParser:
                 )
             )
         option_parts = split_top_level(body, ";")
+        if len(option_parts) > MAX_RULE_OPTIONS + 1:
+            raise ConverterError("Rule option budget exceeded; declare a smaller rule")
         if body.strip() and option_parts[-1].strip():
             diagnostics.append(
                 Diagnostic(
@@ -1524,26 +1591,25 @@ def infer_dialect(rule: Rule) -> str:
         (index for index, option in enumerate(rule.options) if option.key == "content"),
         None,
     )
-    for index, option in enumerate(rule.options):
-        if option.key not in LEGACY_TO_DOTTED_BUFFER or option.key == "file_data":
-            continue
-        if first_content is None or index < first_content:
+    legacy_indexes = [
+        index
+        for index, option in enumerate(rule.options)
+        if option.key in LEGACY_TO_DOTTED_BUFFER and option.key != "file_data"
+    ]
+    if legacy_indexes:
+        if first_content is None or any(index < first_content for index in legacy_indexes):
             return "snort3"
-        previous = index - 1
-        while previous >= 0 and rule.options[previous].key in CONTENT_MODIFIERS:
-            previous -= 1
-        if previous >= 0 and rule.options[previous].key == "content":
-            return "snort2"
+        return "ambiguous"
     return "snort2"
 
 
 def semantic_fingerprint(rule: Rule) -> str:
     normalized = {
-        "header": rule.canonical_header().lower(),
+        "header": rule.canonical_header(),
         "options": [
             [
                 option.key,
-                " ".join(option.value.split()) if option.value is not None else None,
+                option.value,
             ]
             for option in rule.options
             if option.key not in {"rev"}
@@ -1792,6 +1858,10 @@ def transform_to_snort3(options: Sequence[RuleOption], source_dialect: str) -> l
 
 def render_rule(rule: Rule, target: str, source_dialect: str | None = None) -> str:
     dialect = source_dialect or infer_dialect(rule)
+    if dialect == "ambiguous":
+        if target == "ambiguous":
+            return f"{rule.canonical_header()} ({' '.join(option.rendered() for option in rule.options)})"
+        raise ConverterError("Ambiguous buffer placement requires an explicit source dialect")
     if target == "snort3":
         options = transform_to_snort3(rule.options, dialect)
         rendered: list[str] = []
@@ -2191,6 +2261,17 @@ def convert_rules(
     result = ConversionResult(target=target)
     for rule in rules:
         dialect = infer_dialect(rule) if source_dialect == "auto" else source_dialect
+        if dialect == "ambiguous":
+            result.diagnostics.append(
+                option_diagnostic(
+                    rule,
+                    "error",
+                    "AMBIGUOUS_SOURCE_DIALECT",
+                    "Legacy buffer placement has incompatible Snort 2 and Snort 3 meanings. Choose --source-dialect explicitly.",
+                )
+            )
+            result.rejected_rule_indexes.append(rule.index)
+            continue
         diagnostics, unverified = compatibility_diagnostics(rule, target, strict, dialect)
         result.diagnostics.extend(diagnostics)
         result.unverified_keywords.update(unverified)
@@ -2492,6 +2573,15 @@ def preceding_pattern(rule: Rule, option_index: int) -> RuleOption | None:
 
 def panorama_option_checks(rule: Rule) -> list[Diagnostic]:
     diagnostics: list[Diagnostic] = []
+    if infer_dialect(rule) == "ambiguous":
+        return [
+            option_diagnostic(
+                rule,
+                "error",
+                "AMBIGUOUS_SOURCE_DIALECT",
+                "Buffer placement has incompatible Snort 2 and Snort 3 meanings; Panorama preflight cannot verify it.",
+            )
+        ]
     allowed_actions = {"alert", "drop", "log", "pass", "reject", "sdrop"}
     if rule.action not in allowed_actions:
         diagnostics.append(
@@ -2571,13 +2661,17 @@ def panorama_option_checks(rule: Rule) -> list[Diagnostic]:
                 )
             )
         if key in {"distance", "within"}:
-            if option.value is None or not re.fullmatch(r"[0-9]+", option.value.strip()):
+            if (
+                option.value is None
+                or len(option.value.strip()) > 10
+                or not re.fullmatch(r"[0-9]+", option.value.strip())
+            ):
                 diagnostics.append(
                     option_diagnostic(
                         rule,
                         "error",
                         "PANORAMA_POSITION_NOT_INTEGER",
-                        f"{option.name} must use an integer value",
+                        f"{option.name} must use a bounded unsigned integer value",
                         option.name,
                     )
                 )
@@ -2600,6 +2694,7 @@ def panorama_option_checks(rule: Rule) -> list[Diagnostic]:
                 key == "within"
                 and option.value is not None
                 and option.value.strip().isdigit()
+                and len(option.value.strip()) <= 10
                 and int(option.value.strip()) > 100
             ):
                 diagnostics.append(
@@ -2847,7 +2942,7 @@ def report_as_text(report: Mapping[str, Any]) -> str:
         lines.append(
             f"[{str(item['severity']).upper()}] {item['code']} ({location}{sid}): {item['message']}"
         )
-    return "\n".join(lines) + "\n"
+    return "\n".join(terminal_safe(line) for line in lines) + "\n"
 
 
 def ruleset_diff(before: ParseResult, after: ParseResult) -> dict[str, Any]:
@@ -2937,6 +3032,8 @@ def safe_archive_name(name: str) -> PurePosixPath:
         | {f"COM{number}" for number in range(1, 10)}
         | {f"LPT{number}" for number in range(1, 10)}
     )
+    if len(path.parts) > MAX_ARCHIVE_PATH_DEPTH:
+        raise ConverterError("Archive path exceeds its depth budget")
     for part in path.parts:
         stem = part.split(".", 1)[0].upper()
         if stem in reserved:
@@ -2986,6 +3083,16 @@ class DecompressionBudget:
         return value
 
 
+def check_archive_object_budget(names: Iterable[str]) -> None:
+    objects: set[tuple[str, ...]] = set()
+    for name in names:
+        parts = tuple(part.casefold() for part in safe_archive_name(name).parts)
+        for depth in range(1, len(parts) + 1):
+            objects.add(parts[:depth])
+            if len(objects) > MAX_ARCHIVE_ENTRIES:
+                raise ConverterError("Archive exceeds its total filesystem object budget")
+
+
 def validate_tar_archive(data: bytes) -> list[tarfile.TarInfo]:
     if not data.startswith(b"\x1f\x8b"):
         raise ConverterError("Expected a gzip-compressed TAR archive")
@@ -3023,6 +3130,7 @@ def validate_tar_archive(data: bytes) -> list[tarfile.TarInfo]:
                 members.append(member)
     except (tarfile.TarError, OSError, EOFError, RecursionError) as exc:
         raise ConverterError(f"Downloaded file is not a valid bounded TAR archive: {exc}") from exc
+    check_archive_object_budget(member.name for member in members)
     return members
 
 
@@ -3054,6 +3162,7 @@ def validate_zip_archive(data: bytes) -> list[zipfile.ZipInfo]:
         total += member.file_size
         if total > MAX_EXTRACTED_BYTES:
             raise ConverterError(f"Archive expands beyond the {MAX_EXTRACTED_BYTES:,} byte limit")
+    check_archive_object_budget(member.filename.rstrip("/") for member in members)
     return members
 
 
@@ -3065,8 +3174,7 @@ def extract_archive(data: bytes, archive_type: str, output_dir: Path, force: boo
     ):
         raise ConverterError("Extraction root cannot be a link or reparse point")
     output_dir = canonical_system_path(output_dir.expanduser().absolute())
-    reject_parent_links(output_dir)
-    output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    output_dir = ensure_output_directory(output_dir)
     written: list[Path] = []
 
     def destination_for(name: str) -> Path:
@@ -3086,7 +3194,7 @@ def extract_archive(data: bytes, archive_type: str, output_dir: Path, force: boo
             for member in members:
                 destination = destination_for(member.name)
                 if member.isdir():
-                    destination.mkdir(parents=True, exist_ok=True)
+                    ensure_output_directory(destination)
                     continue
                 extracted = archive.extractfile(member)
                 if extracted is None:
@@ -3107,7 +3215,7 @@ def extract_archive(data: bytes, archive_type: str, output_dir: Path, force: boo
             for member in members:
                 destination = destination_for(member.filename.rstrip("/"))
                 if member.is_dir():
-                    destination.mkdir(parents=True, exist_ok=True)
+                    ensure_output_directory(destination)
                     continue
                 atomic_write_bytes(destination, archive.read(member), force=force)
                 written.append(destination)
@@ -3218,6 +3326,10 @@ def download_feed(source_name: str) -> tuple[bytes, dict[str, Any]]:
     return data, metadata
 
 
+def terminal_safe(value: object) -> str:
+    return json.dumps(str(value), ensure_ascii=True)[1:-1]
+
+
 def print_diagnostics(diagnostics: Sequence[Diagnostic], limit: int = 25) -> None:
     for item in diagnostics[:limit]:
         location = (
@@ -3225,7 +3337,7 @@ def print_diagnostics(diagnostics: Sequence[Diagnostic], limit: int = 25) -> Non
         )
         sid = f" SID {item.sid}" if item.sid is not None else ""
         print(
-            f"{item.severity.upper()}: {item.code}: {location}{sid}: {item.message}",
+            terminal_safe(f"{item.severity.upper()}: {item.code}: {location}{sid}: {item.message}"),
             file=sys.stderr,
         )
     if len(diagnostics) > limit:
@@ -3268,7 +3380,7 @@ def command_analyze(args: argparse.Namespace) -> int:
     if args.output:
         ensure_outputs_do_not_replace_inputs((args.output,), (args.input,))
         destination = atomic_write_text(args.output, output, force=args.force)
-        print(f"Wrote analysis to {destination}")
+        print(f"Wrote analysis to {terminal_safe(destination)}")
     else:
         print(output, end="")
     has_conflicts = bool(report["conflicting_sid_groups"])
@@ -3315,7 +3427,7 @@ def command_convert(args: argparse.Namespace) -> int:
             "diagnostics": [item.to_dict() for item in parsed.diagnostics],
         }
         atomic_write_text(args.output, json_text(payload), force=args.force)
-        print(f"Exported {len(parsed.rules):,} rules to {args.output}")
+        print(f"Exported {len(parsed.rules):,} rules to {terminal_safe(args.output)}")
         return EXIT_OK
     converted = convert_rules(
         parsed.rules,
@@ -3382,7 +3494,9 @@ def command_convert(args: argparse.Namespace) -> int:
         }
         atomic_write_text(args.report, json_text(report), force=args.force)
     atomic_write_text(args.output, "\n".join(output_lines), force=args.force)
-    print(f"Converted {len(converted.rules):,} rules to {args.target}: {args.output}")
+    print(
+        f"Converted {len(converted.rules):,} rules to {args.target}: {terminal_safe(args.output)}"
+    )
     print_diagnostics(all_diagnostics)
     return EXIT_FINDINGS if converted.rejected_rule_indexes else EXIT_OK
 
@@ -3391,8 +3505,7 @@ def command_panorama(args: argparse.Namespace) -> int:
     parsed = RuleParser().parse_file(args.input)
     report, accepted, rejected, diagnostics = build_panorama_report(parsed)
     output_dir = canonical_system_path(args.output_dir.expanduser().absolute())
-    reject_parent_links(output_dir)
-    output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    output_dir = ensure_output_directory(output_dir)
     files: list[tuple[Path, str]] = []
     for offset in range(0, len(accepted), PANORAMA_MAX_RULES_PER_BATCH):
         batch = accepted[offset : offset + PANORAMA_MAX_RULES_PER_BATCH]
@@ -3423,7 +3536,7 @@ def command_panorama(args: argparse.Namespace) -> int:
         atomic_write_text(path, content, force=args.force)
     print(
         f"Panorama {PANORAMA_PROFILE} preflight: {len(accepted):,} accepted, {len(rejected):,} rejected, "
-        f"{report['batch_count']:,} batches. Reports: {output_dir}"
+        f"{report['batch_count']:,} batches. Reports: {terminal_safe(output_dir)}"
     )
     print_diagnostics(diagnostics)
     return EXIT_FINDINGS if parsed.errors or rejected else EXIT_OK
@@ -3437,7 +3550,7 @@ def command_diff(args: argparse.Namespace) -> int:
     if args.output:
         ensure_outputs_do_not_replace_inputs((args.output,), (args.before, args.after))
         atomic_write_text(args.output, output, force=args.force)
-        print(f"Wrote ruleset diff to {args.output}")
+        print(f"Wrote ruleset diff to {terminal_safe(args.output)}")
     else:
         print(output, end="")
     summary = report["summary"]
@@ -3455,8 +3568,7 @@ def command_fetch(args: argparse.Namespace) -> int:
     source = FEEDS[args.source]
     extension = ".tar.gz" if source["archive"] == "tar.gz" else ".zip"
     output_dir = canonical_system_path(args.output_dir.expanduser().absolute())
-    reject_parent_links(output_dir)
-    output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    output_dir = ensure_output_directory(output_dir)
     archive_path = output_dir / f"{args.source}{extension}"
     metadata_path = output_dir / f"{args.source}.metadata.json"
     ensure_outputs_available((archive_path, metadata_path), args.force)
@@ -3475,13 +3587,13 @@ def command_fetch(args: argparse.Namespace) -> int:
         ]
         if extraction_root.exists() or extraction_root.is_symlink():
             raise ConverterError("Fetch extraction root must not already exist")
-        extraction_root.mkdir(mode=0o700)
-        extraction_root_resolved = extraction_root.resolve()
+        ensure_output_directory(extraction_root, exclusive=True)
+        extraction_root_resolved = extraction_root
         extraction_paths = []
         for name in names:
             relative = safe_archive_name(name)
             destination = extraction_root_resolved.joinpath(*relative.parts)
-            if not destination.resolve(strict=False).is_relative_to(extraction_root_resolved):
+            if not destination.absolute().is_relative_to(extraction_root_resolved):
                 raise ConverterError(f"Archive entry escapes the output directory: {name!r}")
             extraction_paths.append(destination)
         ensure_outputs_available(extraction_paths, args.force)
@@ -3596,10 +3708,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("Interrupted.", file=sys.stderr)
         return 130
     except ConverterError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        print(f"ERROR: {terminal_safe(exc)}", file=sys.stderr)
         return EXIT_OPERATIONAL_ERROR
     except OSError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        print(f"ERROR: {terminal_safe(exc)}", file=sys.stderr)
         return EXIT_OPERATIONAL_ERROR
 
 

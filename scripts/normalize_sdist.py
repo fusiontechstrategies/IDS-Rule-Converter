@@ -37,6 +37,18 @@ def validate_member_name(name: str) -> None:
         bool(parts) and all(part not in {"", ".", ".."} for part in parts),
         f"Archive member traverses or aliases a path: {name!r}",
     )
+    reserved = {"CON", "PRN", "AUX", "NUL"} | {
+        f"{prefix}{index}" for prefix in ("COM", "LPT") for index in range(1, 10)
+    }
+    require(
+        all(
+            not part.endswith((" ", "."))
+            and part.split(".", 1)[0].upper() not in reserved
+            and all(ord(char) >= 32 and ord(char) != 127 and char not in '<>:"|?*' for char in part)
+            for part in parts
+        ),
+        f"Archive member uses a nonportable path: {name!r}",
+    )
 
 
 def content_digest(value: bytes) -> str:

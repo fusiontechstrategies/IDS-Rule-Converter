@@ -50,6 +50,22 @@ def verify_assets(directory, expected):
         raise ValueError("Release asset bytes differ from the final verified manifest")
 
 
+def verify_distributions(directory, expected):
+    selected = {
+        name: digest for name, digest in expected.items() if name.endswith((".whl", ".tar.gz"))
+    }
+    if len(selected) != 2 or {path.name for path in directory.iterdir()} != set(selected):
+        raise ValueError("Publication must contain exactly the two verified distributions")
+    for name, digest in selected.items():
+        path = directory / name
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or hashlib.sha256(path.read_bytes()).hexdigest() != digest
+        ):
+            raise ValueError("Publication distribution differs from the attested original")
+
+
 def verify_tag(repository, tag, commit):
     if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag):
         raise ValueError("Invalid release tag")
@@ -77,6 +93,9 @@ def main():
     assets = commands.add_parser("assets")
     assets.add_argument("directory", type=Path)
     assets.add_argument("expected")
+    distributions = commands.add_parser("distributions")
+    distributions.add_argument("directory", type=Path)
+    distributions.add_argument("expected")
     remote = commands.add_parser("tag")
     remote.add_argument("repository")
     remote.add_argument("tag")
@@ -115,6 +134,8 @@ def main():
                 "scripts/normalize_sdist.py",
             ),
         )
+    elif args.operation == "distributions":
+        verify_distributions(args.directory, json.loads(args.expected))
     elif args.operation == "assets":
         if args.expected == "-":
             print(json.dumps(manifest(args.directory), sort_keys=True, separators=(",", ":")))
