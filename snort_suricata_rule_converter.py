@@ -708,6 +708,18 @@ def reject_parent_links(path: Path) -> None:
             raise ConverterError("Output parent contains a link or reparse point")
 
 
+def canonical_system_path(path: Path) -> Path:
+    """Expand only macOS root-owned system aliases, never user-created links."""
+    if sys.platform == "darwin" and len(path.parts) > 1 and path.parts[1] in {"var", "tmp"}:
+        alias = Path("/") / path.parts[1]
+        expected = Path("/private") / path.parts[1]
+        if alias.is_symlink() and alias.lstat().st_uid == 0 and alias.resolve() == expected:
+            root = Path("/").stat()
+            if root.st_uid == 0 and not stat.S_IMODE(root.st_mode) & 0o022:
+                return expected.joinpath(*path.parts[2:])
+    return path
+
+
 def open_posix_directory(path: Path) -> int:
     """Walk from the root through no-follow descriptors and pin each component."""
     if sys.platform == "win32":
@@ -726,7 +738,7 @@ def open_posix_directory(path: Path) -> int:
 
 
 def ensure_output_path(path: Path, force: bool) -> Path:
-    requested = path.expanduser().absolute()
+    requested = canonical_system_path(path.expanduser().absolute())
     resolved_parent = requested.parent
     reject_parent_links(resolved_parent)
     resolved_parent.mkdir(parents=True, exist_ok=True)
@@ -762,7 +774,7 @@ def ensure_outputs_do_not_replace_inputs(outputs: Iterable[Path], inputs: Iterab
     protected = {os.path.normcase(str(path.expanduser().resolve())) for path in inputs}
     for path in outputs:
         resolved = ensure_output_path(path, True)
-        if os.path.normcase(str(resolved)) in protected:
+        if os.path.normcase(str(resolved.resolve())) in protected:
             raise ConverterError(f"Output path would replace an input file: {resolved}")
 
 
@@ -2991,7 +3003,7 @@ def extract_archive(data: bytes, archive_type: str, output_dir: Path, force: boo
         & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     ):
         raise ConverterError("Extraction root cannot be a link or reparse point")
-    output_dir = output_dir.expanduser().absolute()
+    output_dir = canonical_system_path(output_dir.expanduser().absolute())
     reject_parent_links(output_dir)
     output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     written: list[Path] = []
@@ -2999,7 +3011,7 @@ def extract_archive(data: bytes, archive_type: str, output_dir: Path, force: boo
     def destination_for(name: str) -> Path:
         relative = safe_archive_name(name)
         destination = output_dir.joinpath(*relative.parts)
-        if not destination.resolve(strict=False).is_relative_to(output_dir):
+        if not destination.absolute().is_relative_to(output_dir):
             raise ConverterError(f"Archive entry escapes the output directory: {name!r}")
         return destination
 
