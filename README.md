@@ -109,6 +109,18 @@ Snort 2 backward content modifier or a Snort 3 forward sticky buffer. Use
 source engine. The tool does not guess which payload or HTTP buffer a pattern
 should inspect. Panorama preflight also rejects these ambiguous rules.
 
+Even with an explicit Snort 2 source, a backward buffer modifier must be
+associated with its preceding content. A modifier separated by `flow`,
+`metadata`, or another unrelated option is rejected for Snort 3 and Suricata,
+including with `--allow-unverified`. It is never reinterpreted as a forward
+selector for a later pattern.
+
+Non-rule text after a closed rule on the same logical line is a parse error.
+The complete prefix is withheld, so conversion and Panorama cannot publish
+an artifact that silently drops trailing conditions. Separate complete rules
+on one line remain supported; standalone directives on separate lines are
+still reported as ignored text.
+
 Processing is bounded to 128 MiB per input, 1 MiB per rule, 256 options per
 rule, 100,000 parsed rules, 1,000,000 total options, and 10,000 diagnostics.
 Exceeding any parser budget aborts the operation, including with

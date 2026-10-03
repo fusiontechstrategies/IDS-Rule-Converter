@@ -1504,14 +1504,21 @@ class RuleParser:
         index = 0
         line = 1
         length = len(text)
+        # Do not expose a complete prefix until the remainder of its logical
+        # line is accounted for. A directive is ignorable only at a line start.
+        pending: list[tuple[str, int, int]] = []
         while index < length:
             if len(result.diagnostics) >= MAX_DIAGNOSTICS:
                 raise ConverterError("Parser diagnostic budget exceeded; no partial output is safe")
             while index < length and text[index].isspace():
                 if text[index] == "\n":
+                    yield from pending
+                    pending.clear()
                     line += 1
                 index += 1
             if index >= length:
+                yield from pending
+                pending.clear()
                 break
             line_end = text.find("\n", index)
             if line_end == -1:
@@ -1534,6 +1541,22 @@ class RuleParser:
                 or text.startswith(("(", "->", "<>"), following_index)
             )
             if token not in RULE_ACTIONS and not looks_like_rule:
+                if pending or text[index] == ")":
+                    result.diagnostics.append(
+                        Diagnostic(
+                            "error",
+                            "TRAILING_RULE_TEXT" if pending else "UNMATCHED_CLOSING_PARENTHESIS",
+                            "Non-rule text follows a closed rule on the same logical line"
+                            if pending
+                            else "Unexpected closing parenthesis outside a rule",
+                            result.source,
+                            line,
+                            line,
+                        )
+                    )
+                    pending.clear()
+                    index = line_end
+                    continue
                 result.ignored_directives += 1
                 preview = " ".join(text[index : min(line_end, index + 160)].strip().split())
                 if preview:
@@ -1577,11 +1600,16 @@ class RuleParser:
                     depth -= 1
                     if depth == 0:
                         index += 1
-                        yield text[start:index].strip(), start_line, line
+                        pending.append((text[start:index].strip(), start_line, line))
+                        if len(pending) > MAX_PARSED_RULES:
+                            raise ConverterError(
+                                "Parser rule count budget exceeded; no partial output is safe"
+                            )
                         break
                     if depth < 0:
                         break
                 if index - start > MAX_RULE_CHARS:
+                    pending.clear()
                     result.diagnostics.append(
                         Diagnostic(
                             "error",
@@ -1597,6 +1625,7 @@ class RuleParser:
                     break
                 index += 1
             else:
+                pending.clear()
                 result.diagnostics.append(
                     Diagnostic(
                         "error",
@@ -1607,6 +1636,7 @@ class RuleParser:
                         line,
                     )
                 )
+        yield from pending
 
     def _parse_record(
         self, raw: str, source: str, start_line: int, end_line: int, index: int
@@ -2759,7 +2789,7 @@ def compatibility_diagnostics(
             diagnostics.append(
                 option_diagnostic(rule, "error", "UNSAFE_STICKY_BUFFER_DOWNGRADE", str(exc))
             )
-    if target == "snort3" and source_dialect == "snort2":
+    if target in {"snort3", "suricata"} and source_dialect == "snort2":
         associated = set(snort2_content_buffer_indexes(rule.options).values())
         for index, option in enumerate(rule.options):
             if (
