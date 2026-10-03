@@ -205,6 +205,38 @@ LEGACY_TO_DOTTED_BUFFER = {
 }
 DOTTED_TO_LEGACY_BUFFER = {value: key for key, value in LEGACY_TO_DOTTED_BUFFER.items()}
 
+# Suricata's underscore aliases are not all backward modifiers. Its documented
+# HTTP content modifiers apply once to preceding content; file_data, DNS, SIP,
+# http_protocol and http_header_names remain forward sticky selectors.
+SURICATA_BACKWARD_BUFFERS = frozenset(
+    {
+        "http_client_body",
+        "http_cookie",
+        "http_header",
+        "http_host",
+        "http_method",
+        "http_raw_header",
+        "http_raw_host",
+        "http_raw_uri",
+        "http_server_body",
+        "http_stat_code",
+        "http_stat_msg",
+        "http_uri",
+        "http_user_agent",
+    }
+)
+UNMAPPED_SNORT_BUFFERS = frozenset(
+    {
+        "dns_query",
+        "http_header_names",
+        "http_host",
+        "http_protocol",
+        "http_raw_host",
+        "http_server_body",
+        "http_user_agent",
+    }
+)
+
 # Shared explicit selectors change the payload buffer independently of backward
 # Snort 2 HTTP content modifiers. Keep all cursor and restoration paths aligned.
 EXPLICIT_PAYLOAD_SELECTORS = frozenset(
@@ -1944,6 +1976,13 @@ def infer_dialect(rule: Rule) -> str:
         return "snort3"
     if any("." in option.key for option in rule.options):
         return "suricata"
+    # Some underscore aliases are forward selectors in Suricata too. A leading
+    # one therefore cannot disambiguate a later backward-looking HTTP group.
+    forward_aliases = frozenset(LEGACY_TO_DOTTED_BUFFER) - SURICATA_BACKWARD_BUFFERS - {"file_data"}
+    if any(option.key in forward_aliases for option in rule.options) and (
+        snort2_content_buffer_indexes(rule.options, SURICATA_BACKWARD_BUFFERS)
+    ):
+        return "ambiguous"
     first_content = next(
         (index for index, option in enumerate(rule.options) if option.key == "content"),
         None,
@@ -1977,7 +2016,11 @@ def semantic_fingerprint(rule: Rule) -> str:
     ).hexdigest()
 
 
-def snort2_content_buffer_indexes(options: Sequence[RuleOption]) -> dict[int, int]:
+def snort2_content_buffer_indexes(
+    options: Sequence[RuleOption], backward_buffers: frozenset[str] | None = None
+) -> dict[int, int]:
+    if backward_buffers is None:
+        backward_buffers = frozenset(LEGACY_TO_DOTTED_BUFFER) - {"file_data"}
     associations: dict[int, int] = {}
     for index, option in enumerate(options):
         if option.key != "content":
@@ -1985,17 +2028,15 @@ def snort2_content_buffer_indexes(options: Sequence[RuleOption]) -> dict[int, in
         cursor = index + 1
         while cursor < len(options) and options[cursor].key in CONTENT_MODIFIERS:
             cursor += 1
-        if (
-            cursor < len(options)
-            and options[cursor].key in LEGACY_TO_DOTTED_BUFFER
-            and options[cursor].key != "file_data"
-        ):
+        if cursor < len(options) and options[cursor].key in backward_buffers:
             associations[index] = cursor
     return associations
 
 
-def transform_snort2_to_snort3(options: Sequence[RuleOption]) -> list[RuleOption]:
-    associations = snort2_content_buffer_indexes(options)
+def transform_snort2_to_snort3(
+    options: Sequence[RuleOption], backward_buffers: frozenset[str] | None = None
+) -> list[RuleOption]:
+    associations = snort2_content_buffer_indexes(options, backward_buffers)
     associated_buffers = set(associations.values())
     transformed: list[RuleOption] = []
     active_buffer = "pkt_data"
@@ -2087,6 +2128,13 @@ def transform_snort2_to_snort3(options: Sequence[RuleOption]) -> list[RuleOption
 def transform_sticky_to_snort2(
     options: Sequence[RuleOption], source_dialect: str
 ) -> list[RuleOption]:
+    if source_dialect == "suricata":
+        options = [
+            RuleOption(LEGACY_TO_DOTTED_BUFFER[option.key], option.value, option.raw, option.origin)
+            if option.key in LEGACY_TO_DOTTED_BUFFER and option.key not in SURICATA_BACKWARD_BUFFERS
+            else option
+            for option in options
+        ]
     transformed: list[RuleOption] = []
     active_modifier: str | None = None
     selected_buffer = "pkt_data"
@@ -2418,6 +2466,10 @@ def transform_to_suricata(
 def transform_to_snort3(options: Sequence[RuleOption], source_dialect: str) -> list[RuleOption]:
     if source_dialect == "snort2":
         return transform_snort2_to_snort3(options)
+    if source_dialect == "suricata" and any(
+        option.key in SURICATA_BACKWARD_BUFFERS for option in options
+    ):
+        return transform_snort2_to_snort3(options, SURICATA_BACKWARD_BUFFERS)
     transformed: list[RuleOption] = []
     for option in options:
         mapped = DOTTED_TO_LEGACY_BUFFER.get(option.key)
@@ -2579,7 +2631,20 @@ def compatibility_diagnostics(
             )
     for option_index, option in enumerate(rule.options):
         key = option.key
-        if target == "suricata" and key == "service":
+        if target in {"snort2", "snort3"} and (
+            key in UNMAPPED_SNORT_BUFFERS
+            or DOTTED_TO_LEGACY_BUFFER.get(key) in UNMAPPED_SNORT_BUFFERS
+        ):
+            diagnostics.append(
+                option_diagnostic(
+                    rule,
+                    "error",
+                    "UNSUPPORTED_TARGET_BUFFER",
+                    f"Buffer '{option.name}' has no proven {target} selector mapping",
+                    option.name,
+                )
+            )
+        elif target == "suricata" and key == "service":
             mapped_service = (
                 mapped_suricata_service(option.value) if option.value is not None else None
             )
@@ -2789,14 +2854,17 @@ def compatibility_diagnostics(
             diagnostics.append(
                 option_diagnostic(rule, "error", "UNSAFE_STICKY_BUFFER_DOWNGRADE", str(exc))
             )
-    if target in {"snort3", "suricata"} and source_dialect == "snort2":
-        associated = set(snort2_content_buffer_indexes(rule.options).values())
+    backward_buffers = (
+        SURICATA_BACKWARD_BUFFERS
+        if source_dialect == "suricata"
+        else frozenset(LEGACY_TO_DOTTED_BUFFER) - {"file_data"}
+    )
+    if (target in {"snort3", "suricata"} and source_dialect == "snort2") or (
+        target in {"snort2", "snort3"} and source_dialect == "suricata"
+    ):
+        associated = set(snort2_content_buffer_indexes(rule.options, backward_buffers).values())
         for index, option in enumerate(rule.options):
-            if (
-                option.key in LEGACY_TO_DOTTED_BUFFER
-                and option.key != "file_data"
-                and index not in associated
-            ):
+            if option.key in backward_buffers and index not in associated:
                 diagnostics.append(
                     option_diagnostic(
                         rule,
@@ -2806,6 +2874,27 @@ def compatibility_diagnostics(
                         option.name,
                     )
                 )
+        if (
+            source_dialect == "suricata"
+            and any(option.key in backward_buffers for option in rule.options)
+            and any(
+                option.key in DOTTED_TO_LEGACY_BUFFER
+                or (
+                    option.key in LEGACY_TO_DOTTED_BUFFER
+                    and option.key not in backward_buffers
+                    and option.key != "file_data"
+                )
+                for option in rule.options
+            )
+        ):
+            diagnostics.append(
+                option_diagnostic(
+                    rule,
+                    "error",
+                    "MIXED_SURICATA_BUFFER_FORMS",
+                    "Mixed Suricata sticky selectors and backward content modifiers cannot be safely converted",
+                )
+            )
     if unverified and strict:
         sample = ", ".join(sorted(unverified)[:8])
         diagnostics.append(
@@ -3051,23 +3140,40 @@ def pattern_contexts(rule: Rule) -> list[tuple[RuleOption, str, bool]]:
     """Return pattern, effective buffer, and case-insensitive intent."""
     dialect = infer_dialect(rule)
     results: list[tuple[RuleOption, str, bool]] = []
-    if dialect == "snort2":
-        buffer_indexes = snort2_content_buffer_indexes(rule.options)
-        for index, option in enumerate(rule.options):
-            if option.key == "content":
-                modifier_index = buffer_indexes.get(index)
-                context = (
-                    rule.options[modifier_index].key if modifier_index is not None else "pkt_data"
-                )
-                cursor = index + 1
-                modifiers: set[str] = set()
-                while cursor < len(rule.options) and rule.options[cursor].key in CONTENT_MODIFIERS:
-                    modifiers.add(rule.options[cursor].key)
-                    cursor += 1
-                results.append((option, context, "nocase" in modifiers))
-            elif option.key == "pcre" and option.value is not None:
-                flags = pcre_flags(option.value)
-                contexts = {
+    backward_buffers = (
+        frozenset(LEGACY_TO_DOTTED_BUFFER) - {"file_data"}
+        if dialect == "snort2"
+        else SURICATA_BACKWARD_BUFFERS
+        if dialect == "suricata"
+        else frozenset()
+    )
+    buffer_indexes = snort2_content_buffer_indexes(rule.options, backward_buffers)
+    active_context = "pkt_data"
+    for index, option in enumerate(rule.options):
+        key = option.key
+        if key in DOTTED_TO_LEGACY_BUFFER:
+            active_context = DOTTED_TO_LEGACY_BUFFER[key]
+        elif (
+            key in LEGACY_TO_DOTTED_BUFFER and key not in backward_buffers
+        ) or key in EXPLICIT_PAYLOAD_SELECTORS:
+            active_context = key
+        elif key == "content":
+            modifier_index = buffer_indexes.get(index)
+            context = (
+                rule.options[modifier_index].key if modifier_index is not None else active_context
+            )
+            cursor = index + 1
+            modifiers: set[str] = set()
+            while cursor < len(rule.options) and (
+                rule.options[cursor].key in CONTENT_MODIFIERS or cursor == modifier_index
+            ):
+                modifiers.add(rule.options[cursor].key)
+                cursor += 1
+            results.append((option, context, "nocase" in modifiers))
+        elif key == "pcre" and option.value is not None:
+            flags = pcre_flags(option.value)
+            contexts = (
+                {
                     "U": "http_uri",
                     "I": "http_raw_uri",
                     "P": "http_client_body",
@@ -3078,28 +3184,11 @@ def pattern_contexts(rule: Rule) -> list[tuple[RuleOption, str, bool]]:
                     "S": "http_stat_code",
                     "Y": "http_stat_msg",
                 }
-                context = next((contexts[flag] for flag in flags if flag in contexts), "pkt_data")
-                results.append((option, context, "i" in flags))
-        return results
-
-    active_context = "pkt_data"
-    for index, option in enumerate(rule.options):
-        key = option.key
-        if key in DOTTED_TO_LEGACY_BUFFER:
-            active_context = DOTTED_TO_LEGACY_BUFFER[key]
-        elif (
-            dialect == "snort3" and key in LEGACY_TO_DOTTED_BUFFER
-        ) or key in EXPLICIT_PAYLOAD_SELECTORS:
-            active_context = key
-        elif key == "content":
-            cursor = index + 1
-            modifiers: set[str] = set()
-            while cursor < len(rule.options) and rule.options[cursor].key in CONTENT_MODIFIERS:
-                modifiers.add(rule.options[cursor].key)
-                cursor += 1
-            results.append((option, active_context, "nocase" in modifiers))
-        elif key == "pcre" and option.value is not None:
-            results.append((option, active_context, "i" in pcre_flags(option.value)))
+                if dialect == "snort2"
+                else {}
+            )
+            context = next((contexts[flag] for flag in flags if flag in contexts), active_context)
+            results.append((option, context, "i" in flags))
     return results
 
 

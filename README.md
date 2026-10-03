@@ -164,6 +164,28 @@ every rule will detect identical traffic under every engine configuration.
 
 ## Panorama preflight
 
+Explicit Suricata input keeps legacy HTTP content modifiers attached to the
+preceding content when converting to Snort 3. Later payload matches restore
+their payload buffer. Mixed sticky selectors and backward HTTP modifiers,
+orphan modifiers, and cursor-dependent translations without a proven mapping
+are rejected even with `--allow-unverified`. Suricata's underscore aliases for
+forward selectors, such as `http_protocol`, remain distinct from backward HTTP
+modifiers. See the [Suricata HTTP syntax reference](https://docs.suricata.io/en/suricata-7.0.12/rules/http-keywords.html)
+and [Snort 3 HTTP selectors](https://docs.snort.org/rules/options/payload/http/).
+Automatic dialect inference also rejects mixed underscore forward aliases and
+backward HTTP groups; choose a source dialect only after inspecting the input.
+The Suricata buffers `dns_query`, `http_header_names`, `http_host`,
+`http_protocol`, `http_raw_host`, `http_server_body` and `http_user_agent`
+(including dotted forms) have no proven Snort target mapping and are refused
+even with `--allow-unverified`. Native Snort 3 validation identified these
+unsupported selector names; this tool does not guess at a substitute field.
+
+Panorama case checks track `file_data` and explicit payload-buffer transitions
+for both content and PCRE. A file-data match requesting `nocase` is rejected
+under the plugin's fixed case-sensitive file-data compatibility model; a
+case-sensitive file-data match can pass the remaining checks. This is an
+offline compatibility model, not execution against a Panorama appliance.
+
 The Panorama command performs an offline compatibility review for IPS Signature
 Converter plugin 2.0.4. It checks documented action, protocol, condition, PCRE,
 threshold, reference, case-sensitivity, negation, and positional limits. Accepted
