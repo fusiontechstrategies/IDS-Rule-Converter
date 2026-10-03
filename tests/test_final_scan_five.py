@@ -321,6 +321,35 @@ class FinalScanFive(unittest.TestCase):
                 next_request = handler.parent.open.call_args.args[0]
                 self.assertEqual(next_request.full_url, "https://example.test/final")
 
+    def test_308_preserves_read_methods_and_never_replays_post_body(self):
+        for method in ("GET", "HEAD", "POST"):
+            handler = app.RestrictedRedirectHandler({"example.test"})
+            parent = MagicMock()
+            handler.add_parent(parent)
+            request = urllib.request.Request(
+                "https://example.test/start",
+                method=method,
+                data=b"private" if method == "POST" else None,
+            )
+            request.timeout = 30
+            headers = email.message.Message()
+            headers["Location"] = "/final"
+            fp = MagicMock()
+            fp.read.side_effect = AssertionError("Redirect body must not be read")
+            with self.subTest(method=method):
+                if method == "POST":
+                    with self.assertRaises(urllib.error.HTTPError) as rejected:
+                        handler.http_error_308(request, fp, 308, "Redirect", headers)
+                    self.assertEqual(rejected.exception.code, 308)
+                    parent.open.assert_not_called()
+                else:
+                    handler.http_error_308(request, fp, 308, "Redirect", headers)
+                    redirected = parent.open.call_args.args[0]
+                    self.assertEqual(redirected.get_method(), method)
+                    self.assertIsNone(redirected.data)
+                fp.read.assert_not_called()
+                fp.close.assert_called_once()
+
     def test_redirect_invalid_destination_missing_location_loop_and_deadline_fail_closed(self):
         for location in (
             "http://example.test/no",

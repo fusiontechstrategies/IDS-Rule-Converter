@@ -3928,7 +3928,15 @@ class RestrictedRedirectHandler(urllib.request.HTTPRedirectHandler):
     ) -> Any:
         if not is_allowed_https_url(newurl, self.allowed_hosts):
             raise ConverterError(f"Refused redirect outside the HTTPS source allowlist: {newurl}")
-        return super().redirect_request(request, fp, code, msg, headers, newurl)
+        # Python 3.10 has no 308 adapter. For feed GET/HEAD requests, its 307
+        # adapter has the same method-preserving behavior. Never replay a body.
+        if code == 308 and request.get_method() not in {"GET", "HEAD"}:
+            raise urllib.error.HTTPError(request.full_url, code, msg, headers, fp)
+        delegated_code = 307 if code == 308 else code
+        redirected = super().redirect_request(request, fp, delegated_code, msg, headers, newurl)
+        if code == 308 and redirected is not None:
+            redirected.method = request.get_method()
+        return redirected
 
     def http_error_302(
         self, request: urllib.request.Request, fp: Any, code: int, msg: str, headers: Any
