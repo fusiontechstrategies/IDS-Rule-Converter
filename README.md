@@ -78,6 +78,12 @@ python snort_suricata_rule_converter.py convert input.rules --source-dialect sno
 An intentional partial result exits with code 2 so automation cannot mistake it
 for a complete conversion.
 
+Reviewed partial conversion writes the current rejection file even when its
+count is zero. Primary/rejection comments and the JSON report share a generation
+ID; the report binds the intended UTF-8 artifacts by SHA-256. Verify those hashes
+before consuming the files. Each leaf is published atomically, but publication
+of the three files is not a single transaction.
+
 ### Strict and reviewed partial results
 
 ![Synthetic two-rule IDS conversion comparison showing strict mode writing no ruleset and reviewed partial mode separating one accepted rule, one rejected rule, and a JSON report while returning exit code 2.](docs/images/ids-rule-converter-safety-comparison.png)
@@ -120,6 +126,11 @@ The complete prefix is withheld, so conversion and Panorama cannot publish
 an artifact that silently drops trailing conditions. Separate complete rules
 on one line remain supported; standalone directives on separate lines are
 still reported as ignored text.
+
+Snort 3 `file_id` supports its documented one-token header only. Protocol,
+address, port or direction fields on that action are refused by the parser and
+all public manual-rule/rendering/JSON paths. Ordinary network and service headers
+retain their existing grammar.
 
 Processing is bounded to 128 MiB per input, 1 MiB per rule, 256 options per
 rule, 100,000 parsed rules, 1,000,000 total options, and 10,000 diagnostics.
@@ -211,6 +222,33 @@ python snort_suricata_rule_converter.py fetch --source snort3-community --output
 The downloaded archive, SHA-256 metadata, and extracted files are local outputs.
 Rules remain subject to their provider's terms and are not part of this project's
 Apache 2.0 license.
+
+Fetch supervises a fresh Python spawn worker under one 30-second deadline,
+including DNS, connect, TLS, redirects, headers, body and byte-only IPC. On failure
+or interruption it cancels and reaps the worker. Operating-system process
+creation/termination latency remains outside the application deadline. Library
+callers must use normal import-safe guarded process startup; frozen executables
+and interactive embedding are not supported by this fetch supervisor. It trusts
+the installed interpreter, module and caller startup; it does not use isolated
+Python mode or execute selected feed code.
+On the main thread, a callable SIGINT handler is deferred during process and
+reader startup until both have been adopted for cleanup, then restored and
+invoked. Its original returning or raising behavior is preserved. Calls on other
+threads and ignored/default OS signal dispositions are unchanged. Arbitrary
+asynchronous exceptions and forced OS termination are outside this cleanup
+guarantee.
+
+Extraction returns paths beneath a new `generation-<id>` directory after every
+member has decoded successfully. The fetch metadata lists those completed paths.
+ZIP file entities are independently counted and checksummed through complete
+stored/raw-deflate input with bounded chunks before the standard extraction writer.
+This changes the earlier direct-member output layout. Each call, including
+`force=True`, preserves earlier generations and user files; it never overwrites
+them. Unsupported atomic no-replace directory publication is refused. Failed
+staging cleanup is limited to that newly created private generation and may
+require owner review if its identity or contents no longer match.
+Windows extraction roots must be a private child below a drive anchor; the drive
+anchor itself is refused, including aliases that present a directory as an anchor.
 
 Feed metadata records a SHA-256 digest of both the configured URL and the complete
 effective redirect target, including parameters and query order, without the

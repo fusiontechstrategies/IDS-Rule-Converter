@@ -392,7 +392,7 @@ class LibrarySnapshots(unittest.TestCase):
                 self.assertEqual(app.feed_url_provenance(url + fragment)[1], digest)
         self.assertEqual(len(set(hashes)), len(targets))
 
-    def test_actual_feed_composition_records_redacted_source_and_final_target_digests(self):
+    def test_actual_worker_composition_records_redacted_source_and_final_target_digests(self):
         class Response(io.BytesIO):
             def __init__(self, value=b""):
                 super().__init__(value)
@@ -416,7 +416,7 @@ class LibrarySnapshots(unittest.TestCase):
             ),
             patch.object(app.urllib.request, "build_opener", return_value=opener),
         ):
-            data, metadata = app.download_feed("fixture")
+            data, metadata = app._download_feed_in_worker("fixture")
         self.assertEqual(data, b"fixture")
         self.assertEqual(opener.request.full_url, source)
         self.assertNotIn("SYNTHETIC", json.dumps(metadata))

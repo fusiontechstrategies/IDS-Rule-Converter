@@ -14,14 +14,17 @@ import gzip
 import hashlib
 import io
 import json
+import multiprocessing
 import os
 import re
+import signal
 import ssl
 import stat
 import struct
 import subprocess  # nosec B404
 import sys
 import tarfile
+import threading
 import time
 import unicodedata
 import urllib.error
@@ -29,6 +32,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import zipfile
+import zlib
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, suppress
@@ -53,6 +57,8 @@ MAX_TOTAL_OPTIONS = 1_000_000
 MAX_DIAGNOSTICS = 10_000
 MAX_ARCHIVE_PATH_DEPTH = 32
 MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024
+FEED_DEADLINE_SECONDS = 30
+MAX_FEED_METADATA_BYTES = 64 * 1024
 MAX_ARCHIVE_ENTRIES = 20_000
 MAX_ZIP_DIRECTORY_BYTES = 8 * 1024 * 1024
 MAX_EXTRACTED_BYTES = 512 * 1024 * 1024
@@ -86,6 +92,7 @@ RULE_ACTIONS = {
     "rewrite",
     "sdrop",
 }
+RULE_TOKEN_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
 
 TARGET_ACTIONS = {
     "snort2": {
@@ -554,6 +561,7 @@ class Rule:
         return unquote(value)
 
     def canonical_header(self) -> str:
+        require_rule_header_shape(self)
         require_text_without_nul(
             self.action,
             self.protocol,
@@ -645,6 +653,7 @@ def require_text_without_nul(*values: str | None) -> None:
 
 
 def validate_rule_text(rule: Rule) -> None:
+    require_rule_header_shape(rule)
     require_text_without_nul(
         rule.raw,
         rule.source,
@@ -657,6 +666,26 @@ def validate_rule_text(rule: Rule) -> None:
         rule.destination_port,
     )
     validate_options_text(rule.options)
+
+
+def require_rule_header_shape(rule: Rule) -> None:
+    """A file identification header has no protocol or network fields to discard."""
+    if rule.action.casefold() == "file_id" and (
+        rule.protocol != ""
+        or any(
+            value is not None
+            for value in (
+                rule.source_address,
+                rule.source_port,
+                rule.direction,
+                rule.destination_address,
+                rule.destination_port,
+            )
+        )
+    ):
+        raise ConverterError(
+            "file_id requires its one-token header with no protocol/network fields"
+        )
 
 
 def validate_options_text(options: Sequence[RuleOption]) -> None:
@@ -1863,6 +1892,7 @@ class RuleParser:
         index = 0
         line = 1
         length = len(text)
+        line_end = -1
         # Do not expose a complete prefix until the remainder of its logical
         # line is accounted for. A directive is ignorable only at a line start.
         pending: list[tuple[str, int, int]] = []
@@ -1879,26 +1909,30 @@ class RuleParser:
                 yield from pending
                 pending.clear()
                 break
-            line_end = text.find("\n", index)
-            if line_end == -1:
-                line_end = length
-            token_match = re.match(r"[A-Za-z_][A-Za-z0-9_-]*", text[index:line_end])
-            token = token_match.group(0).lower() if token_match else ""
+            if index >= line_end:
+                line_end = text.find("\n", index)
+                if line_end == -1:
+                    line_end = length
             if line_end - index > MAX_RULE_CHARS:
                 raise ConverterError("Input line exceeds the rule classification budget")
-            header_preview = text[index:line_end]
-            following_index = line_end
-            following_limit = min(length, line_end + MAX_RULE_CHARS)
-            while following_index < following_limit and text[following_index].isspace():
-                following_index += 1
-            looks_like_rule = (
-                ("->" in header_preview or "<>" in header_preview)
-                or (
-                    "(" in header_preview
-                    and len(split_header(header_preview.split("(", 1)[0])) == 2
+            token_match = RULE_TOKEN_PATTERN.match(text, index, line_end)
+            token = token_match.group(0).lower() if token_match else ""
+            looks_like_rule = token in RULE_ACTIONS
+            if not looks_like_rule:
+                # Inspect only this header, not each subsequent option body or record.
+                opening = text.find("(", index, line_end)
+                header_end = line_end if opening == -1 else opening
+                looks_like_rule = (
+                    text.find("->", index, header_end) != -1
+                    or text.find("<>", index, header_end) != -1
+                    or (opening != -1 and len(split_header(text[index:header_end])) == 2)
                 )
-                or text.startswith(("(", "->", "<>"), following_index)
-            )
+                if not looks_like_rule:
+                    following_index = line_end
+                    following_limit = min(length, line_end + MAX_RULE_CHARS)
+                    while following_index < following_limit and text[following_index].isspace():
+                        following_index += 1
+                    looks_like_rule = text.startswith(("(", "->", "<>"), following_index)
             if token not in RULE_ACTIONS and not looks_like_rule:
                 if pending or text[index] == ")":
                     result.diagnostics.append(
@@ -2225,6 +2259,10 @@ class RuleParser:
     @staticmethod
     def _validate_rule(rule: Rule) -> list[Diagnostic]:
         diagnostics: list[Diagnostic] = []
+        try:
+            require_rule_header_shape(rule)
+        except ConverterError as exc:
+            diagnostics.append(option_diagnostic(rule, "error", "INVALID_FILE_ID_HEADER", str(exc)))
         sid_values = rule.values("sid")
         if not sid_values:
             diagnostics.append(
@@ -4406,6 +4444,24 @@ def check_archive_object_budget(names: Iterable[str]) -> None:
                 raise ConverterError("Archive exceeds its total filesystem object budget")
 
 
+def archive_path_graph(entries: Iterable[tuple[str, bool]]) -> dict[tuple[str, ...], bool]:
+    """Admit one portable spelling and file/directory type for every path node."""
+    nodes: dict[tuple[str, ...], tuple[tuple[str, ...], bool]] = {}
+    for name, directory in entries:
+        parts = safe_archive_name(name).parts
+        for depth in range(1, len(parts) + 1):
+            spelling = parts[:depth]
+            key = tuple(unicodedata.normalize("NFC", part).casefold() for part in spelling)
+            kind = directory if depth == len(parts) else True
+            previous = nodes.get(key)
+            if previous is not None and previous != (spelling, kind):
+                raise ConverterError("Archive paths have conflicting types or portable spellings")
+            nodes[key] = (spelling, kind)
+            if len(nodes) > MAX_ARCHIVE_ENTRIES:
+                raise ConverterError("Archive exceeds its total filesystem object budget")
+    return dict(nodes.values())
+
+
 def preflight_archive_input(data: bytes) -> None:
     if len(data) > MAX_DOWNLOAD_BYTES:
         raise ConverterError("Archive input exceeds the download byte limit")
@@ -4441,6 +4497,8 @@ def validate_tar_archive(data: bytes) -> list[tarfile.TarInfo]:
                     raise ConverterError(
                         f"Archive contains a link or special file: {member.name!r}"
                     )
+                if member.isdir() and member.size != 0:
+                    raise ConverterError("Archive directory carries an unexpected payload")
                 if member.size < 0 or member.size > MAX_EXTRACTED_FILE_BYTES:
                     raise ConverterError(f"Archive entry is too large: {member.name!r}")
                 total += member.size
@@ -4450,6 +4508,7 @@ def validate_tar_archive(data: bytes) -> list[tarfile.TarInfo]:
     except (tarfile.TarError, OSError, EOFError, RecursionError) as exc:
         raise ConverterError(f"Downloaded file is not a valid bounded TAR archive: {exc}") from exc
     check_archive_object_budget(member.name for member in members)
+    archive_path_graph((member.name, member.isdir()) for member in members)
     return members
 
 
@@ -4583,77 +4642,542 @@ def validate_zip_archive(data: bytes) -> list[zipfile.ZipInfo]:
         unix_mode = (member.external_attr >> 16) & 0xFFFF
         if (unix_mode & 0o170000) == 0o120000:
             raise ConverterError(f"Archive contains a symbolic link: {member.filename!r}")
+        expected_kind = stat.S_IFDIR if member.is_dir() else stat.S_IFREG
+        if stat.S_IFMT(unix_mode) not in {0, expected_kind} or (
+            not member.is_dir() and member.external_attr & 0x10
+        ):
+            raise ConverterError("ZIP member type disagrees with its path")
+        if member.is_dir() and member.file_size != 0:
+            raise ConverterError("Archive directory carries an unexpected payload")
         if member.file_size < 0 or member.file_size > MAX_EXTRACTED_FILE_BYTES:
             raise ConverterError(f"Archive entry is too large: {member.filename!r}")
         total += member.file_size
         if total > MAX_EXTRACTED_BYTES:
             raise ConverterError(f"Archive expands beyond the {MAX_EXTRACTED_BYTES:,} byte limit")
     check_archive_object_budget(member.filename.rstrip("/") for member in members)
+    archive_path_graph((member.filename.rstrip("/"), member.is_dir()) for member in members)
     return members
 
 
+def _validate_zip_directory_entity(data: bytes, member: zipfile.ZipInfo) -> None:
+    """Validate an empty directory's complete bounded stored/deflate entity."""
+    if not member.is_dir() or member.file_size != 0 or member.CRC != 0:
+        raise ConverterError("ZIP directory entity does not describe empty content")
+    offset = member.header_offset
+    if offset < 0 or offset + 30 > len(data):
+        raise ConverterError("ZIP directory entity has invalid local bounds")
+    name_size, extra_size = struct.unpack_from("<HH", data, offset + 26)
+    start = offset + 30 + name_size + extra_size
+    end = start + member.compress_size
+    if member.compress_size < 0 or end > len(data):
+        raise ConverterError("ZIP directory entity exceeds its admitted bounds")
+    if member.compress_type == zipfile.ZIP_STORED:
+        if member.compress_size != 0:
+            raise ConverterError("Stored ZIP directory carries an unexpected entity")
+        return
+    if member.compress_type != zipfile.ZIP_DEFLATED:
+        raise ConverterError("ZIP directory uses an unsupported decoder")
+    decoder = zlib.decompressobj(-zlib.MAX_WBITS)
+    decoded = decoder.decompress(memoryview(data)[start:end], 1)
+    if decoded or not decoder.eof or decoder.unconsumed_tail or decoder.unused_data:
+        raise ConverterError("ZIP directory entity did not decode as complete empty content")
+
+
+def _validate_zip_file_entity(data: bytes, member: zipfile.ZipInfo) -> None:
+    """Count and checksum a complete entity independently of ZipExtFile's size clipping."""
+    if member.is_dir() or not 0 <= member.file_size <= MAX_EXTRACTED_FILE_BYTES:
+        raise ConverterError("ZIP file entity has an invalid admitted size")
+    offset = member.header_offset
+    if offset < 0 or offset + 30 > len(data):
+        raise ConverterError("ZIP file entity has invalid local bounds")
+    name_size, extra_size = struct.unpack_from("<HH", data, offset + 26)
+    start = offset + 30 + name_size + extra_size
+    end = start + member.compress_size
+    if member.compress_size < 0 or end > len(data):
+        raise ConverterError("ZIP file entity exceeds its admitted bounds")
+    count, checksum = 0, 0
+    if member.compress_type == zipfile.ZIP_STORED:
+        if member.compress_size != member.file_size:
+            raise ConverterError("Stored ZIP entity length differs from its admitted size")
+        for position in range(start, end, 64 * 1024):
+            block = memoryview(data)[position : min(position + 64 * 1024, end)]
+            count += len(block)
+            checksum = zlib.crc32(block, checksum)
+    elif member.compress_type == zipfile.ZIP_DEFLATED:
+        decoder = zlib.decompressobj(-zlib.MAX_WBITS)
+        position, pending = start, b""
+        while True:
+            if not pending and position < end:
+                next_position = min(position + 64 * 1024, end)
+                pending = memoryview(data)[position:next_position]
+                position = next_position
+            input_size = len(pending)
+            block = decoder.decompress(pending, min(64 * 1024, member.file_size - count + 1))
+            pending = decoder.unconsumed_tail
+            count += len(block)
+            if count > member.file_size:
+                raise ConverterError("ZIP entity decodes beyond its admitted size")
+            checksum = zlib.crc32(block, checksum)
+            if decoder.eof:
+                if pending or decoder.unused_data or position != end:
+                    raise ConverterError("ZIP entity has input beyond its complete stream")
+                break
+            if not block and ((not pending and position == end) or len(pending) == input_size):
+                raise ConverterError("ZIP entity decoder did not complete or make progress")
+    else:
+        raise ConverterError("ZIP file uses an unsupported decoder")
+    if count != member.file_size or checksum != member.CRC:
+        raise ConverterError("ZIP entity decoded size or checksum differs from its admission")
+
+
+def _require_windows_archive_child(path) -> None:
+    if not path.drive or path.drive.startswith("\\") or ".." in path.parts:
+        raise ConverterError("Archive generations require a local drive-letter namespace")
+    if not path.name:
+        raise ConverterError(
+            "Windows archive generations require a private child below the drive anchor"
+        )
+
+
+class _WindowsArchiveApi:
+    """Native one-component creation, disposal and no-replace directory publication."""
+
+    def __init__(self):
+        import ctypes.wintypes
+
+        self.ctypes, self.wintypes = ctypes, ctypes.wintypes
+        self.sid = current_windows_sid()
+        w = self.wintypes
+
+        class UnicodeString(ctypes.Structure):
+            _fields_ = [("length", w.USHORT), ("maximum", w.USHORT), ("buffer", w.LPWSTR)]
+
+        class ObjectAttributes(ctypes.Structure):
+            _fields_ = [
+                ("length", w.ULONG),
+                ("root", w.HANDLE),
+                ("name", ctypes.POINTER(UnicodeString)),
+                ("attributes", w.ULONG),
+                ("security", ctypes.c_void_p),
+                ("quality", ctypes.c_void_p),
+            ]
+
+        class IoStatusBlock(ctypes.Structure):
+            _fields_ = [("status", ctypes.c_void_p), ("information", ctypes.c_size_t)]
+
+        class FileInformation(ctypes.Structure):
+            _fields_ = [
+                ("attributes", w.DWORD),
+                ("created", w.FILETIME),
+                ("accessed", w.FILETIME),
+                ("written", w.FILETIME),
+                ("volume", w.DWORD),
+                ("size_high", w.DWORD),
+                ("size_low", w.DWORD),
+                ("links", w.DWORD),
+                ("index_high", w.DWORD),
+                ("index_low", w.DWORD),
+            ]
+
+        self.UnicodeString, self.ObjectAttributes = UnicodeString, ObjectAttributes
+        self.IoStatusBlock, self.FileInformation = IoStatusBlock, FileInformation
+        self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.native = ctypes.WinDLL("ntdll")
+        self.security = ctypes.WinDLL("advapi32", use_last_error=True)
+        self.kernel.CloseHandle.argtypes, self.kernel.CloseHandle.restype = [w.HANDLE], w.BOOL
+        self.kernel.LocalFree.argtypes, self.kernel.LocalFree.restype = (
+            [ctypes.c_void_p],
+            ctypes.c_void_p,
+        )
+        self.kernel.GetFileInformationByHandle.argtypes = [
+            w.HANDLE,
+            ctypes.POINTER(FileInformation),
+        ]
+        self.kernel.GetFileInformationByHandle.restype = w.BOOL
+        self.native.NtCreateFile.argtypes = [
+            ctypes.POINTER(w.HANDLE),
+            w.DWORD,
+            ctypes.POINTER(ObjectAttributes),
+            ctypes.POINTER(IoStatusBlock),
+            ctypes.c_void_p,
+            w.ULONG,
+            w.ULONG,
+            w.ULONG,
+            w.ULONG,
+            ctypes.c_void_p,
+            w.ULONG,
+        ]
+        self.native.NtCreateFile.restype = ctypes.c_int32
+        self.native.NtSetInformationFile.argtypes = [
+            w.HANDLE,
+            ctypes.POINTER(IoStatusBlock),
+            ctypes.c_void_p,
+            w.ULONG,
+            ctypes.c_int,
+        ]
+        self.native.NtSetInformationFile.restype = ctypes.c_int32
+        self.native.RtlNtStatusToDosError.argtypes = [ctypes.c_int32]
+        self.native.RtlNtStatusToDosError.restype = w.ULONG
+        self.security.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+            w.LPCWSTR,
+            w.DWORD,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_void_p,
+        ]
+        self.security.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = w.BOOL
+
+    def check(self, status):
+        if status < 0:
+            raise self.ctypes.WinError(self.native.RtlNtStatusToDosError(status))
+
+    def identity(self, handle):
+        info = self.FileInformation()
+        if not self.kernel.GetFileInformationByHandle(handle, self.ctypes.byref(info)):
+            raise self.ctypes.WinError(self.ctypes.get_last_error())
+        return info.volume, info.index_high, info.index_low
+
+    @contextmanager
+    def object(self, parent, name, *, directory, create=False, delete=False, private=False):
+        c, w = self.ctypes, self.wintypes
+        if safe_archive_name(name).parts != (name,):
+            raise ConverterError("Native archive operations require one path component")
+        encoded = name.encode("utf-16-le")
+        if len(encoded) > 65532:
+            raise ConverterError("Archive component exceeds its native name budget")
+        buffer = c.create_unicode_buffer(name)
+        string = self.UnicodeString(len(encoded), len(encoded) + 2, c.cast(buffer, w.LPWSTR))
+        descriptor = c.c_void_p()
+        if create and not self.security.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            f"O:{self.sid}D:P(A;OICI;FA;;;{self.sid})",
+            1,
+            c.byref(descriptor),
+            None,
+        ):
+            raise c.WinError(c.get_last_error())
+        try:
+            attributes = self.ObjectAttributes(
+                c.sizeof(self.ObjectAttributes), parent, c.pointer(string), 0x1040, descriptor, None
+            )
+            status, handle = self.IoStatusBlock(), w.HANDLE()
+            access = 0x120080 | (1 if directory else 0) | (0x10000 if delete else 0)
+            self.check(
+                self.native.NtCreateFile(
+                    c.byref(handle),
+                    access,
+                    c.byref(attributes),
+                    c.byref(status),
+                    None,
+                    0x10 if directory else 0x80,
+                    3,
+                    2 if create else 1,
+                    0x200020 | (1 if directory else 0x40),
+                    None,
+                    0,
+                )
+            )
+        finally:
+            if descriptor:
+                self.kernel.LocalFree(descriptor)
+        try:
+            validate_windows_input_component(handle, directory=directory)
+            if private and directory:
+                verify_windows_parent_security(handle, self.sid, True)
+            yield handle
+        finally:
+            self.kernel.CloseHandle(handle)
+
+    def dispose(self, handle):
+        c = self.ctypes
+        disposition, status = c.c_ubyte(1), self.IoStatusBlock()
+        self.check(
+            self.native.NtSetInformationFile(
+                handle, c.byref(status), c.byref(disposition), c.sizeof(disposition), 13
+            )
+        )
+
+    def publish(self, handle, parent, name):
+        c, w = self.ctypes, self.wintypes
+        if safe_archive_name(name).parts != (name,):
+            raise ConverterError("Generation publication requires one path component")
+
+        class RenameInformation(c.Structure):
+            _fields_ = (
+                ("replace", c.c_ubyte),
+                ("root", w.HANDLE),
+                ("length", w.ULONG),
+                ("name", w.WCHAR * 1),
+            )
+
+        encoded = name.encode("utf-16-le")
+        buffer = c.create_string_buffer(c.sizeof(RenameInformation) + len(encoded))
+        info = RenameInformation.from_buffer(buffer)
+        info.replace, info.root, info.length = 0, parent, len(encoded)
+        c.memmove(c.addressof(buffer) + RenameInformation.name.offset, encoded, len(encoded))
+        status = self.IoStatusBlock()
+        self.check(
+            self.native.NtSetInformationFile(handle, c.byref(status), buffer, len(buffer), 10)
+        )
+
+
+@contextmanager
+def _archive_root_namespace(path: Path, api):
+    if api is None:
+        with input_parent_namespace(path / ".ids-generation-anchor") as (_, parent):
+            info = os.fstat(parent)
+            if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o022:
+                raise ConverterError("Archive root must be private and owned by this user")
+            yield parent
+        return
+    _require_windows_archive_child(path)
+    sid = current_windows_sid()
+    with ExitStack() as stack:
+        parent = open_windows_input_component(None, path.anchor, directory=True)
+        stack.callback(api.kernel.CloseHandle, parent)
+        validate_windows_input_component(parent, directory=True)
+        verify_windows_parent_security(parent, sid, path == Path(path.anchor))
+        for index, part in enumerate(path.parts[1:], 1):
+            parent = stack.enter_context(api.object(parent, part, directory=True))
+            verify_windows_parent_security(parent, sid, index == len(path.parts) - 1)
+        yield parent
+
+
+@contextmanager
+def _generation_parent(parent, parts, api):
+    with ExitStack() as stack:
+        for part in parts:
+            if api is None:
+                owner = stack.enter_context(
+                    _input_directory_descriptor(
+                        part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, parent=parent
+                    )
+                )
+                parent = owner.fileno()
+            else:
+                parent = stack.enter_context(api.object(parent, part, directory=True, private=True))
+        yield parent
+
+
+def _publish_posix_generation(parent: int, staging: str, final: str) -> None:
+    import ctypes
+
+    library = ctypes.CDLL(None, use_errno=True)
+    name, flag = ("renameatx_np", 4) if sys.platform == "darwin" else ("renameat2", 1)
+    function = getattr(library, name, None)
+    if function is None:
+        raise ConverterError("Atomic no-replace directory generations are unsupported")
+    function.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    function.restype = ctypes.c_int
+    if function(parent, os.fsencode(staging), parent, os.fsencode(final), flag) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+def _cleanup_archive_generation(parent, name, identity, graph, api):
+    """Remove only this created private generation, through its retained namespace."""
+    with ExitStack() as stack:
+        if api is None:
+            owner = stack.enter_context(
+                _input_directory_descriptor(
+                    name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, parent=parent
+                )
+            )
+            staging = owner.fileno()
+            info = os.fstat(staging)
+            actual = info.st_dev, info.st_ino
+        else:
+            staging = stack.enter_context(api.object(parent, name, directory=True, private=True))
+            actual = api.identity(staging)
+        if actual != identity:
+            raise ConverterError("Staging identity changed; cleanup requires owner review")
+        for parts, directory in sorted(graph.items(), key=lambda item: len(item[0]), reverse=True):
+            try:
+                with _generation_parent(staging, parts[:-1], api) as container:
+                    if api is None:
+                        info = os.stat(parts[-1], dir_fd=container, follow_symlinks=False)
+                        if not (
+                            stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+                        ):
+                            raise ConverterError("Staging object type changed; cleanup refused")
+                        if directory:
+                            os.rmdir(parts[-1], dir_fd=container)
+                        else:
+                            os.unlink(parts[-1], dir_fd=container)
+                    else:
+                        with api.object(
+                            container, parts[-1], directory=directory, delete=True, private=True
+                        ) as entry:
+                            api.dispose(entry)
+            except FileNotFoundError:
+                continue
+    if api is None:
+        info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if (info.st_dev, info.st_ino) != identity:
+            raise ConverterError("Staging identity changed; cleanup refused")
+        os.rmdir(name, dir_fd=parent)
+    else:
+        with api.object(parent, name, directory=True, delete=True, private=True) as entry:
+            if api.identity(entry) != identity:
+                raise ConverterError("Staging identity changed; cleanup refused")
+            api.dispose(entry)
+
+
+@contextmanager
+def _archive_generation(output_dir: Path, graph):
+    api = _WindowsArchiveApi() if os.name == "nt" else None
+    token = uuid.uuid4().hex
+    staging_name, final_name = ".ids-stage-" + token, "generation-" + token
+    staging_path, final_path = output_dir / staging_name, output_dir / final_name
+    with _archive_root_namespace(output_dir, api) as parent:
+        identity = None
+        try:
+            with ExitStack() as stack:
+                if api is None:
+                    os.mkdir(staging_name, 0o700, dir_fd=parent)
+                    owner = stack.enter_context(
+                        _input_directory_descriptor(
+                            staging_name,
+                            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            parent=parent,
+                        )
+                    )
+                    staging = owner.fileno()
+                    info = os.fstat(staging)
+                    identity = info.st_dev, info.st_ino
+                else:
+                    staging = stack.enter_context(
+                        api.object(parent, staging_name, directory=True, create=True, private=True)
+                    )
+                    identity = api.identity(staging)
+                for parts, directory in sorted(graph.items(), key=lambda item: len(item[0])):
+                    if not directory:
+                        continue
+                    with _generation_parent(staging, parts[:-1], api) as container:
+                        if api is None:
+                            os.mkdir(parts[-1], 0o700, dir_fd=container)
+                        else:
+                            with api.object(
+                                container, parts[-1], directory=True, create=True, private=True
+                            ):
+                                pass
+                yield staging_path, final_path
+            if api is None:
+                info = os.stat(staging_name, dir_fd=parent, follow_symlinks=False)
+                if (info.st_dev, info.st_ino) != identity:
+                    raise ConverterError("Staging identity changed; publication refused")
+                _publish_posix_generation(parent, staging_name, final_name)
+            else:
+                with api.object(
+                    parent, staging_name, directory=True, delete=True, private=True
+                ) as entry:
+                    if api.identity(entry) != identity:
+                        raise ConverterError("Staging identity changed; publication refused")
+                    api.publish(entry, parent, final_name)
+        except BaseException:
+            if identity is not None:
+                _cleanup_archive_generation(parent, staging_name, identity, graph, api)
+            raise
+
+
 def extract_archive(data: bytes, archive_type: str, output_dir: Path, force: bool) -> list[Path]:
+    """Return one complete immutable generation; never replace earlier/user files."""
     preflight_archive_input(data)
-    if output_dir.is_symlink() or (
-        output_dir.exists()
-        and getattr(output_dir.lstat(), "st_file_attributes", 0)
-        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-    ):
-        raise ConverterError("Extraction root cannot be a link or reparse point")
-    output_dir = canonical_system_path(output_dir.expanduser().absolute())
-    output_dir = ensure_output_directory(output_dir)
-    written: list[Path] = []
-
-    def destination_for(name: str) -> Path:
-        relative = safe_archive_name(name)
-        destination = output_dir.joinpath(*relative.parts)
-        if not destination.absolute().is_relative_to(output_dir):
-            raise ConverterError(f"Archive entry escapes the output directory: {name!r}")
-        return destination
-
     if archive_type == "tar.gz":
         members = validate_tar_archive(data)
-        ensure_outputs_available(
-            (destination_for(member.name) for member in members if member.isfile()),
-            force,
-        )
-        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
-            for member in members:
-                destination = destination_for(member.name)
-                if member.isdir():
-                    ensure_output_directory(destination)
-                    continue
-                extracted = archive.extractfile(member)
-                if extracted is None:
-                    raise ConverterError(f"Cannot read archive entry: {member.name!r}")
-                with extracted:
-                    atomic_write_bytes(
-                        destination, extracted, force=force, expected_size=member.size
-                    )
-                written.append(destination)
+        entries = [(member.name, member.isdir()) for member in members]
     elif archive_type == "zip":
         members = validate_zip_archive(data)
-        ensure_outputs_available(
-            (
-                destination_for(member.filename.rstrip("/"))
-                for member in members
-                if not member.is_dir()
-            ),
-            force,
-        )
-        with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            for member in members:
-                destination = destination_for(member.filename.rstrip("/"))
-                if member.is_dir():
-                    ensure_output_directory(destination)
-                    continue
-                with archive.open(member) as content:
-                    atomic_write_bytes(
-                        destination, content, force=force, expected_size=member.file_size
-                    )
-                written.append(destination)
+        entries = [(member.filename.rstrip("/"), member.is_dir()) for member in members]
     else:
         raise ConverterError(f"Unsupported archive type: {archive_type}")
+    graph = archive_path_graph(entries)
+    if os.name == "nt":
+        _require_windows_archive_child(output_dir.absolute())
+    output_dir = ensure_output_directory(output_dir)
+    written = []
+    # force is retained for source compatibility; every call gets a fresh,
+    # no-replace generation, so it never grants deletion of existing content.
+    try:
+        with _archive_generation(output_dir, graph) as (staging, final):
+            if archive_type == "tar.gz":
+                with gzip.GzipFile(fileobj=io.BytesIO(data)) as compressed:
+                    bounded = DecompressionBudget(compressed)
+                    with tarfile.open(
+                        fileobj=bounded, mode="r|", tarinfo=BoundedTarInfo
+                    ) as archive:
+                        member_index = 0
+                        while True:
+                            archive._ids_extension_count = 0
+                            member = archive.next()
+                            if member is None:
+                                break
+                            if member_index >= len(members):
+                                raise ConverterError(
+                                    "Archive changed between admission and decoding"
+                                )
+                            admitted = members[member_index]
+                            if (member.name, member.type, member.size) != (
+                                admitted.name,
+                                admitted.type,
+                                admitted.size,
+                            ):
+                                raise ConverterError(
+                                    "Archive changed between admission and decoding"
+                                )
+                            member_index += 1
+                            if member.isdir():
+                                continue
+                            relative = safe_archive_name(member.name)
+                            extracted = archive.extractfile(member)
+                            if extracted is None:
+                                raise ConverterError("Cannot read an admitted archive entry")
+                            with extracted:
+                                atomic_write_bytes(
+                                    staging.joinpath(*relative.parts),
+                                    extracted,
+                                    expected_size=member.size,
+                                )
+                            written.append(final.joinpath(*relative.parts))
+                        # Consume the bounded gzip tail as well, including its checksum.
+                        if member_index != len(members):
+                            raise ConverterError(
+                                "Archive decoding did not complete its admitted members"
+                            )
+                        while True:
+                            remaining = bounded.limit - bounded.count
+                            if remaining <= 0:
+                                raise ConverterError("TAR decompression exceeds its byte budget")
+                            if not bounded.read(min(64 * 1024, remaining)):
+                                break
+            else:
+                with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                    for member in members:
+                        if member.is_dir():
+                            _validate_zip_directory_entity(data, member)
+                            continue
+                        _validate_zip_file_entity(data, member)
+                        relative = safe_archive_name(member.filename)
+                        with archive.open(member) as content:
+                            atomic_write_bytes(
+                                staging.joinpath(*relative.parts),
+                                content,
+                                expected_size=member.file_size,
+                            )
+                        written.append(final.joinpath(*relative.parts))
+    except (
+        zipfile.BadZipFile,
+        tarfile.TarError,
+        EOFError,
+        OSError,
+        RuntimeError,
+        zlib.error,
+    ) as exc:
+        raise ConverterError(f"Archive decoding or generation publication failed: {exc}") from exc
     return written
 
 
@@ -4751,7 +5275,8 @@ def feed_url_provenance(url: str) -> tuple[str, str]:
     return display, hashlib.sha256(effective.encode("utf-8")).hexdigest()
 
 
-def download_feed(source_name: str) -> tuple[bytes, dict[str, Any]]:
+def _download_feed_in_worker(source_name: str) -> tuple[bytes, dict[str, Any]]:
+    """Bounded HTTPS client; its entire lifetime is cancellable by the parent."""
     source = FEEDS[source_name]
     url = str(source["url"])
     allowed_hosts = set(source["hosts"])
@@ -4823,6 +5348,162 @@ def download_feed(source_name: str) -> tuple[bytes, dict[str, Any]]:
         "sha256": hashlib.sha256(data).hexdigest(),
     }
     return data, metadata
+
+
+def _feed_worker_main(source_name: str, output: BinaryIO, error: BinaryIO) -> int:
+    """Emit one bounded frame; this worker never creates output artifacts."""
+    try:
+        if source_name not in FEEDS:
+            raise ConverterError("Unknown built-in feed")
+        data, metadata = _download_feed_in_worker(source_name)
+        encoded = json.dumps(metadata, ensure_ascii=True).encode("utf-8")
+        if len(encoded) > MAX_FEED_METADATA_BYTES or len(data) > MAX_DOWNLOAD_BYTES:
+            raise ConverterError("Feed worker result exceeds its frame budget")
+        output.write(struct.pack(">I", len(encoded)))
+        output.write(encoded)
+        output.write(data)
+        output.flush()
+        return EXIT_OK
+    except ConverterError as exc:
+        error.write(json.dumps({"error": str(exc)[:1024]}, ensure_ascii=True).encode("utf-8"))
+        error.flush()
+        return EXIT_OPERATIONAL_ERROR
+
+
+def _feed_process_worker(source_name: str, connection) -> None:
+    """Constant spawn target; network-derived IPC contains bounded bytes only."""
+    try:
+        output, error = io.BytesIO(), io.BytesIO()
+        status = _feed_worker_main(source_name, output, error)
+        payload = b"\x00" + output.getvalue() if status == EXIT_OK else b"\x01" + error.getvalue()
+        if len(payload) > MAX_DOWNLOAD_BYTES + MAX_FEED_METADATA_BYTES + 5:
+            raise ConverterError("Feed worker result exceeds its IPC budget")
+        connection.send_bytes(payload)
+    finally:
+        connection.close()
+
+
+def _receive_feed_frame(connection, result, completed) -> None:
+    """Supervise receipt in a thread, including a partially delivered pipe frame."""
+    try:
+        result["payload"] = connection.recv_bytes(MAX_DOWNLOAD_BYTES + MAX_FEED_METADATA_BYTES + 5)
+    except (OSError, EOFError) as exc:
+        result["error"] = exc
+    finally:
+        completed.set()
+
+
+def _validate_feed_frame(payload: bytes, source_name: str) -> tuple[bytes, dict[str, Any]]:
+    source = FEEDS[source_name]
+    if len(payload) < 4 or len(payload) > MAX_DOWNLOAD_BYTES + MAX_FEED_METADATA_BYTES + 4:
+        raise ConverterError("Feed worker returned an invalid bounded frame")
+    metadata_size = struct.unpack_from(">I", payload)[0]
+    if metadata_size > MAX_FEED_METADATA_BYTES or metadata_size > len(payload) - 4:
+        raise ConverterError("Feed worker returned invalid metadata bounds")
+    try:
+        metadata = json.loads(payload[4 : 4 + metadata_size])
+    except (ValueError, UnicodeError) as exc:
+        raise ConverterError("Feed worker metadata is invalid") from exc
+    data = payload[4 + metadata_size :]
+    if (
+        not data
+        or len(data) > MAX_DOWNLOAD_BYTES
+        or not isinstance(metadata, dict)
+        or metadata.get("source") != source_name
+        or metadata.get("bytes") != len(data)
+        or metadata.get("sha256") != hashlib.sha256(data).hexdigest()
+        or metadata.get("source_url_sha256") != feed_url_provenance(str(source["url"]))[1]
+    ):
+        raise ConverterError("Feed worker data and provenance do not agree")
+    return data, metadata
+
+
+@contextmanager
+def _feed_startup_interrupt_guard():
+    """Defer a callable main-thread SIGINT handler until startup ownership is adopted."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = signal.getsignal(signal.SIGINT)
+    if not callable(previous):
+        yield
+        return
+    pending = []
+
+    def defer_interrupt(signum, frame):
+        if not pending:
+            pending.append((signum, frame))
+
+    signal.signal(signal.SIGINT, defer_interrupt)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
+        if pending:
+            previous(*pending.pop())
+
+
+def download_feed(source_name: str) -> tuple[bytes, dict[str, Any]]:
+    """Supervise every HTTPS phase and partial IPC under one cancellable deadline."""
+    if source_name not in FEEDS:
+        raise ConverterError("Unknown built-in feed")
+    source = FEEDS[source_name]
+    if not is_allowed_https_url(str(source["url"]), set(source["hosts"])):
+        raise ConverterError("Built-in feed URL failed its HTTPS allowlist check")
+    deadline = time.monotonic() + FEED_DEADLINE_SECONDS
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(target=_feed_process_worker, args=(source_name, sender))
+    reader = None
+    reader_started = False
+    result: dict[str, Any] = {}
+    completed = threading.Event()
+    try:
+        with _feed_startup_interrupt_guard():
+            try:
+                process.start()
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise ConverterError(f"Cannot start the bounded feed worker: {exc}") from exc
+            # Close the parent's writer so cancelled/failed child exit gives EOF,
+            # including while the receiver is waiting for the rest of a frame.
+            sender.close()
+            reader = threading.Thread(
+                target=_receive_feed_frame, args=(receiver, result, completed), daemon=True
+            )
+            reader.start()
+            reader_started = True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not completed.wait(remaining):
+            raise ConverterError("Feed download deadline exceeded; worker cancelled")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ConverterError("Feed download deadline exceeded; worker cancelled")
+        process.join(remaining)
+        if process.is_alive() or time.monotonic() >= deadline:
+            raise ConverterError("Feed download deadline exceeded; worker cancelled")
+        if process.exitcode != EXIT_OK or "error" in result:
+            raise ConverterError("Feed download worker failed to return a complete frame")
+        payload = result.get("payload", b"")
+        if not payload or payload[0] not in {0, 1}:
+            raise ConverterError("Feed worker returned an invalid IPC frame")
+        if payload[0] == 1:
+            detail = payload[1:8193].decode("utf-8", errors="replace")
+            raise ConverterError(f"Feed download worker failed: {detail}")
+        answer = _validate_feed_frame(payload[1:], source_name)
+        if time.monotonic() >= deadline:
+            raise ConverterError("Feed download deadline exceeded")
+        return answer
+    finally:
+        sender.close()
+        if process.pid is not None:
+            if process.is_alive():
+                process.kill()
+            process.join()
+        # Reaping the sole child writer ends a partial receive with EOF.
+        if reader_started:
+            reader.join()
+        receiver.close()
+        process.close()
 
 
 def terminal_safe(value: object) -> str:
@@ -4956,8 +5637,10 @@ def command_convert(args: argparse.Namespace) -> int:
         source_dialect=args.source_dialect,
     )
     all_diagnostics = list(converted.diagnostics)
+    generation_id = uuid.uuid4().hex
     output_lines = [
         f"# Generated by {APP_NAME} {VERSION}",
+        f"# Generation: {generation_id}",
         f"# Source: {json.dumps(Path(parsed.source).name, ensure_ascii=True)}",
         f"# Source SHA-256: {parsed.source_sha256}",
         f"# Source bytes: {parsed.byte_count}",
@@ -4985,18 +5668,22 @@ def command_convert(args: argparse.Namespace) -> int:
             "--allow-partial requires --rejected-output and --report so every excluded rule remains reviewable"
         )
     rejected_text = ""
-    if converted.rejected_rule_indexes:
+    if args.rejected_output:
         rejected_indexes = set(converted.rejected_rule_indexes)
         rejected_rules = [rule for rule in parsed.rules if rule.index in rejected_indexes]
         rejected_text = (
             f"# Rejected by {APP_NAME} {VERSION}\n"
+            f"# Generation: {generation_id}\n"
             f"# Source: {json.dumps(Path(parsed.source).name, ensure_ascii=True)}\n"
+            f"# Source SHA-256: {parsed.source_sha256}\n"
+            f"# Source bytes: {parsed.byte_count}\n"
+            f"# Rejected input rules: {len(converted.rejected_rule_indexes)}\n"
             "# See the JSON conversion report for incompatibility details.\n\n"
             + "\n".join(rule.raw.strip() for rule in rejected_rules)
             + "\n"
         )
     ensure_outputs_available(requested_outputs, args.force)
-    if args.rejected_output and converted.rejected_rule_indexes:
+    if args.rejected_output:
         atomic_write_text(
             args.rejected_output,
             rejected_text,
@@ -5006,6 +5693,7 @@ def command_convert(args: argparse.Namespace) -> int:
     if args.report:
         report = {
             "schema_version": 1,
+            "generation_id": generation_id,
             "generated_at": utc_now(),
             "tool": {"name": APP_NAME, "version": VERSION},
             "source": parsed.source,
@@ -5017,6 +5705,12 @@ def command_convert(args: argparse.Namespace) -> int:
             "input_rules": len(parsed.rules),
             "output_rules": len(converted.rules),
             "rejected_rules": len(converted.rejected_rule_indexes),
+            "artifact_sha256": {
+                "output": hashlib.sha256("\n".join(output_lines).encode("utf-8")).hexdigest(),
+                "rejected": hashlib.sha256(rejected_text.encode("utf-8")).hexdigest()
+                if args.rejected_output
+                else None,
+            },
             "unverified_keywords": dict(sorted(converted.unverified_keywords.items())),
             "diagnostic_counts": diagnostic_counts(all_diagnostics),
             "diagnostics": [item.to_dict() for item in all_diagnostics],
@@ -5161,36 +5855,27 @@ def command_fetch(args: argparse.Namespace) -> int:
     metadata_path = output_dir / f"{args.source}.metadata.json"
     ensure_outputs_available((archive_path, metadata_path), args.force)
     if args.extract:
-        members = (
+        # Admit the complete typed graph before creating the private extraction
+        # root. Member directories belong only to the staged generation.
+        (
             validate_tar_archive(data)
             if source["archive"] == "tar.gz"
             else validate_zip_archive(data)
         )
         extraction_root = output_dir / args.source
-        names = [
-            member.name if isinstance(member, tarfile.TarInfo) else member.filename.rstrip("/")
-            for member in members
-            if not (isinstance(member, tarfile.TarInfo) and member.isdir())
-            and not (isinstance(member, zipfile.ZipInfo) and member.is_dir())
-        ]
         if extraction_root.exists() or extraction_root.is_symlink():
             raise ConverterError("Fetch extraction root must not already exist")
         ensure_output_directory(extraction_root, exclusive=True)
-        extraction_root_resolved = extraction_root
-        extraction_paths = []
-        for name in names:
-            relative = safe_archive_name(name)
-            destination = extraction_root_resolved.joinpath(*relative.parts)
-            if not destination.absolute().is_relative_to(extraction_root_resolved):
-                raise ConverterError(f"Archive entry escapes the output directory: {name!r}")
-            extraction_paths.append(destination)
-        ensure_outputs_available(extraction_paths, args.force)
+        extracted = extract_archive(data, str(source["archive"]), extraction_root, force=args.force)
+        metadata = dict(metadata)
+        metadata["extraction_generation"] = (
+            str(extracted[0].relative_to(extraction_root).parts[0]) if extracted else None
+        )
+        metadata["extracted_files"] = [str(path.relative_to(output_dir)) for path in extracted]
+    # Extraction must complete before its archive/provenance is announced.
     atomic_write_bytes(archive_path, data, force=args.force)
     atomic_write_text(metadata_path, json_text(metadata), force=args.force)
     if args.extract:
-        extracted = extract_archive(
-            data, str(source["archive"]), output_dir / args.source, force=args.force
-        )
         print(
             f"Downloaded and safely extracted {len(extracted):,} files. SHA-256: {metadata['sha256']}"
         )
