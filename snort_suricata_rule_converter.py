@@ -786,14 +786,33 @@ def validate_windows_input_component(handle, *, directory: bool) -> None:
         raise ConverterError("Input component is a link, reparse point, or unsupported object")
 
 
+class _InputDirectoryDescriptor:
+    """Own one retained directory descriptor; refuse use after ownership ends."""
+
+    __slots__ = ("_descriptor",)
+
+    def __init__(self, name: str, flags: int, *, parent: int | None = None):
+        self._descriptor: int | None = os.open(name, flags, dir_fd=parent)
+
+    def fileno(self) -> int:
+        if self._descriptor is None:
+            raise ConverterError("Input directory capability has already closed")
+        return self._descriptor
+
+    def close(self) -> None:
+        descriptor, self._descriptor = self._descriptor, None
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 @contextmanager
 def _input_directory_descriptor(name: str, flags: int, *, parent: int | None = None):
-    """Own one descriptor explicitly, including failures during namespace admission."""
-    descriptor = os.open(name, flags, dir_fd=parent)
+    """Retain the owner, rather than transferring a bare descriptor to the stack."""
+    owner = _InputDirectoryDescriptor(name, flags, parent=parent)
     try:
-        yield descriptor
+        yield owner
     finally:
-        os.close(descriptor)
+        owner.close()
 
 
 @contextmanager
@@ -824,16 +843,16 @@ def input_parent_namespace(path: Path):
             if not hasattr(os, "O_NOFOLLOW") or os.open not in os.supports_dir_fd:
                 raise ConverterError("Input snapshots require no-follow directory-relative opens")
             flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-            parent = stack.enter_context(_input_directory_descriptor(requested.anchor, flags))
+            owner = stack.enter_context(_input_directory_descriptor(requested.anchor, flags))
+            parent = owner.fileno()
             for part in requested.parent.parts[1:]:
                 info = os.fstat(parent)
                 if info.st_uid not in {0, os.geteuid()} or (
                     stat.S_IMODE(info.st_mode) & 0o022 and not info.st_mode & stat.S_ISVTX
                 ):
                     raise ConverterError("Input ancestry can be replaced by another user")
-                parent = stack.enter_context(
-                    _input_directory_descriptor(part, flags, parent=parent)
-                )
+                owner = stack.enter_context(_input_directory_descriptor(part, flags, parent=parent))
+                parent = owner.fileno()
             info = os.fstat(parent)
             if info.st_uid not in {0, os.geteuid()} or (
                 stat.S_IMODE(info.st_mode) & 0o022 and not info.st_mode & stat.S_ISVTX

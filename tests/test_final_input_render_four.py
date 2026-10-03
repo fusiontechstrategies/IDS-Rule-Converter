@@ -280,13 +280,19 @@ class InputRenderFour(unittest.TestCase):
             real_close = os.close
             with app.input_parent_namespace(source) as (requested, parent):
                 with patch.object(os, "close", wraps=real_close) as close:
-                    with (
-                        self.assertRaisesRegex(RuntimeError, "Fixture processing refused"),
-                        app._input_binary_stream(requested, parent) as stream,
-                    ):
-                        descriptor = stream.fileno()
-                        self.assertEqual(stream.read(), RULE.encode())
-                        raise RuntimeError("Fixture processing refused")
+                    opened = []
+
+                    def processing_failure():
+                        with app._input_binary_stream(requested, parent) as stream:
+                            opened.append(stream.fileno())
+                            self.assertEqual(stream.read(), RULE.encode())
+                            raise RuntimeError("Fixture processing refused")
+
+                    self.assertRaisesRegex(
+                        RuntimeError, "Fixture processing refused", processing_failure
+                    )
+                    self.assertEqual(len(opened), 1)
+                    descriptor = opened[0]
                     close.assert_called_once_with(descriptor)
                 with self.assertRaises(OSError):
                     os.fstat(descriptor)
@@ -301,9 +307,9 @@ class InputRenderFour(unittest.TestCase):
 
             @contextmanager
             def tracked(*args, **kwargs):
-                with original(*args, **kwargs) as descriptor:
-                    retained.append(descriptor)
-                    yield descriptor
+                with original(*args, **kwargs) as owner:
+                    retained.append(owner.fileno())
+                    yield owner
 
             with (
                 patch.object(app, "_input_directory_descriptor", tracked),
@@ -314,6 +320,23 @@ class InputRenderFour(unittest.TestCase):
             for descriptor in retained:
                 with self.assertRaises(OSError):
                     os.fstat(descriptor)
+
+    @unittest.skipIf(os.name == "nt", "POSIX retained directory capability")
+    def test_directory_capability_refuses_after_close_and_closes_exactly_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            real_close = os.close
+            with patch.object(os, "close", wraps=real_close) as close:
+                with app._input_directory_descriptor(str(root), flags) as owner:
+                    descriptor = owner.fileno()
+                    self.assertTrue(app.stat.S_ISDIR(os.fstat(descriptor).st_mode))
+                    owner.close()
+                    with self.assertRaises(app.ConverterError):
+                        owner.fileno()
+                close.assert_called_once_with(descriptor)
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
 
 
 if __name__ == "__main__":
