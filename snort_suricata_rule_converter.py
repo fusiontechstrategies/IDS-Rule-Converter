@@ -472,6 +472,7 @@ class RuleOption:
 
     def rendered(self, name: str | None = None) -> str:
         output_name = name or self.name
+        require_text_without_nul(output_name, self.value)
         if self.value is None:
             return f"{output_name};"
         return f"{output_name}:{self.value};"
@@ -553,6 +554,15 @@ class Rule:
         return unquote(value)
 
     def canonical_header(self) -> str:
+        require_text_without_nul(
+            self.action,
+            self.protocol,
+            self.source_address,
+            self.source_port,
+            self.direction,
+            self.destination_address,
+            self.destination_port,
+        )
         if self.action == "file_id":
             return "file_id"
         if self.headerless:
@@ -629,29 +639,135 @@ def unquote(value: str) -> str:
     return ("!" if negated else "") + value
 
 
-def open_input_descriptor(path: Path) -> int:
-    """Open a regular leaf without following it; on Windows exclude data writers/deletion."""
-    if sys.platform != "win32":
-        return os.open(
-            path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-        )
+def require_text_without_nul(*values: str | None) -> None:
+    if any(value is not None and "\x00" in value for value in values):
+        raise ConverterError("Input contains NUL characters and is not a text ruleset")
+
+
+def validate_rule_text(rule: Rule) -> None:
+    require_text_without_nul(
+        rule.raw,
+        rule.source,
+        rule.action,
+        rule.protocol,
+        rule.source_address,
+        rule.source_port,
+        rule.direction,
+        rule.destination_address,
+        rule.destination_port,
+    )
+    validate_options_text(rule.options)
+
+
+def validate_options_text(options: Sequence[RuleOption]) -> None:
+    for option in options:
+        require_text_without_nul(option.name, option.value, option.raw)
+
+
+def open_windows_input_component(parent, name: str, *, directory: bool):
+    """Open one existing component relative to its retained directory handle."""
     import ctypes.wintypes
-    import msvcrt
+
+    wintypes = ctypes.wintypes
+
+    class UnicodeString(ctypes.Structure):
+        _fields_ = [
+            ("length", wintypes.USHORT),
+            ("maximum", wintypes.USHORT),
+            ("buffer", wintypes.LPWSTR),
+        ]
+
+    class ObjectAttributes(ctypes.Structure):
+        _fields_ = [
+            ("length", wintypes.ULONG),
+            ("root", wintypes.HANDLE),
+            ("name", ctypes.POINTER(UnicodeString)),
+            ("attributes", wintypes.ULONG),
+            ("security", ctypes.c_void_p),
+            ("quality", ctypes.c_void_p),
+        ]
+
+    class IoStatusBlock(ctypes.Structure):
+        _fields_ = [("status", ctypes.c_void_p), ("information", ctypes.c_size_t)]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    access = 0x120081 if directory else 0x120089
+    if parent is None:
+        kernel.CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        kernel.CreateFileW.restype = wintypes.HANDLE
+        handle = kernel.CreateFileW(name, access, 1, None, 3, 0x02200000, None)
+        if handle == ctypes.c_void_p(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+    else:
+        if name in {"", ".", ".."} or any(c in name for c in "\\/:"):
+            raise ConverterError("Input component must be one local filesystem name")
+        if name.endswith((" ", ".")):
+            raise ConverterError("Input component cannot have ambiguous Windows suffixes")
+        encoded = name.encode("utf-16-le")
+        if len(encoded) > 65532:
+            raise ConverterError("Input component exceeds its native name budget")
+        buffer = ctypes.create_unicode_buffer(name)
+        string = UnicodeString(len(encoded), len(encoded) + 2, ctypes.cast(buffer, wintypes.LPWSTR))
+        attributes = ObjectAttributes(
+            ctypes.sizeof(ObjectAttributes), parent, ctypes.pointer(string), 0x1040, None, None
+        )
+        status, handle = IoStatusBlock(), wintypes.HANDLE()
+        native = ctypes.WinDLL("ntdll")
+        native.NtCreateFile.argtypes = [
+            ctypes.POINTER(wintypes.HANDLE),
+            wintypes.DWORD,
+            ctypes.POINTER(ObjectAttributes),
+            ctypes.POINTER(IoStatusBlock),
+            ctypes.c_void_p,
+            wintypes.ULONG,
+            wintypes.ULONG,
+            wintypes.ULONG,
+            wintypes.ULONG,
+            ctypes.c_void_p,
+            wintypes.ULONG,
+        ]
+        native.NtCreateFile.restype = ctypes.c_int32
+        native.RtlNtStatusToDosError.argtypes = [ctypes.c_int32]
+        native.RtlNtStatusToDosError.restype = wintypes.ULONG
+        result = native.NtCreateFile(
+            ctypes.byref(handle),
+            access,
+            ctypes.byref(attributes),
+            ctypes.byref(status),
+            None,
+            0,
+            1,
+            1,
+            0x200020 | (1 if directory else 0x40),
+            None,
+            0,
+        )
+        if result < 0:
+            raise ctypes.WinError(native.RtlNtStatusToDosError(result))
+        handle = handle.value
+    try:
+        validate_windows_input_component(handle, directory=directory)
+        return handle
+    except BaseException:
+        kernel.CloseHandle(handle)
+        raise
+
+
+def validate_windows_input_component(handle, *, directory: bool) -> None:
+    import ctypes.wintypes
 
     wintypes = ctypes.wintypes
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel.CreateFileW.argtypes = [
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.HANDLE,
-    ]
-    kernel.CreateFileW.restype = wintypes.HANDLE
-    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel.CloseHandle.restype = wintypes.BOOL
     kernel.GetFileType.argtypes = [wintypes.HANDLE]
     kernel.GetFileType.restype = wintypes.DWORD
     kernel.GetFileInformationByHandleEx.argtypes = [
@@ -661,44 +777,149 @@ def open_input_descriptor(path: Path) -> int:
         wintypes.DWORD,
     ]
     kernel.GetFileInformationByHandleEx.restype = wintypes.BOOL
-    # GENERIC_READ, FILE_SHARE_READ only, OPEN_EXISTING, OPEN_REPARSE_POINT.
-    # Existing writers/writable mappings are refused, as are new write/delete opens.
-    handle = kernel.CreateFileW(str(path), 0x80000000, 1, None, 3, 0x00200000, None)
-    if handle == ctypes.c_void_p(-1).value:
+    attributes = (wintypes.DWORD * 2)()
+    if kernel.GetFileType(handle) != 1:
+        raise ConverterError("Input handle is not a disk object")
+    if not kernel.GetFileInformationByHandleEx(handle, 9, attributes, ctypes.sizeof(attributes)):
         raise ctypes.WinError(ctypes.get_last_error())
+    if attributes[0] & 0x400 or bool(attributes[0] & 0x10) != directory:
+        raise ConverterError("Input component is a link, reparse point, or unsupported object")
+
+
+class _InputDirectoryDescriptor:
+    """Own one retained directory descriptor; refuse use after ownership ends."""
+
+    __slots__ = ("_descriptor",)
+
+    def __init__(self, name: str, flags: int, *, parent: int | None = None):
+        self._descriptor: int | None = os.open(name, flags, dir_fd=parent)
+
+    def fileno(self) -> int:
+        if self._descriptor is None:
+            raise ConverterError("Input directory capability has already closed")
+        return self._descriptor
+
+    def close(self) -> None:
+        descriptor, self._descriptor = self._descriptor, None
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+@contextmanager
+def _input_directory_descriptor(name: str, flags: int, *, parent: int | None = None):
+    """Retain the owner, rather than transferring a bare descriptor to the stack."""
+    owner = _InputDirectoryDescriptor(name, flags, parent=parent)
     try:
-        attributes = (wintypes.DWORD * 2)()
-        if kernel.GetFileType(handle) != 1:
-            raise ConverterError("Input handle is not a disk file")
-        if not kernel.GetFileInformationByHandleEx(
-            handle, 9, attributes, ctypes.sizeof(attributes)
-        ):
-            raise ctypes.WinError(ctypes.get_last_error())
-        if attributes[0] & (0x10 | 0x400):
-            raise ConverterError("Input leaf is a directory or reparse point")
-        descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
-        handle = None  # The CRT descriptor now owns the native handle.
-        return descriptor
+        yield owner
     finally:
-        if handle is not None:
-            kernel.CloseHandle(handle)
+        owner.close()
+
+
+@contextmanager
+def input_parent_namespace(path: Path):
+    """Retain no-follow lexical ancestry for all admission and snapshot operations."""
+    requested = canonical_system_path(path.expanduser().absolute())
+    require_text_without_nul(str(requested))
+    if ".." in requested.parts or not requested.name or requested == Path(requested.anchor):
+        raise ConverterError("Input must select a file without parent traversal")
+    with ExitStack() as stack:
+        if sys.platform == "win32":
+            import ctypes.wintypes
+
+            if not re.fullmatch(r"[A-Za-z]:\\", requested.anchor):
+                raise ConverterError("Input snapshots require a local Windows drive path")
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+            kernel.CloseHandle.restype = ctypes.wintypes.BOOL
+            sid = current_windows_sid()
+            parent = open_windows_input_component(None, requested.anchor, directory=True)
+            stack.callback(kernel.CloseHandle, parent)
+            verify_windows_parent_security(parent, sid)
+            for part in requested.parent.parts[1:]:
+                parent = open_windows_input_component(parent, part, directory=True)
+                stack.callback(kernel.CloseHandle, parent)
+                verify_windows_parent_security(parent, sid)
+        else:
+            if not hasattr(os, "O_NOFOLLOW") or os.open not in os.supports_dir_fd:
+                raise ConverterError("Input snapshots require no-follow directory-relative opens")
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+            owner = stack.enter_context(_input_directory_descriptor(requested.anchor, flags))
+            parent = owner.fileno()
+            for part in requested.parent.parts[1:]:
+                info = os.fstat(parent)
+                if info.st_uid not in {0, os.geteuid()} or (
+                    stat.S_IMODE(info.st_mode) & 0o022 and not info.st_mode & stat.S_ISVTX
+                ):
+                    raise ConverterError("Input ancestry can be replaced by another user")
+                owner = stack.enter_context(_input_directory_descriptor(part, flags, parent=parent))
+                parent = owner.fileno()
+            info = os.fstat(parent)
+            if info.st_uid not in {0, os.geteuid()} or (
+                stat.S_IMODE(info.st_mode) & 0o022 and not info.st_mode & stat.S_ISVTX
+            ):
+                raise ConverterError("Input parent can be replaced by another user")
+        yield requested, parent
+
+
+def _open_input_leaf(path: Path, parent_descriptor) -> int:
+    """Internal leaf open through the capability retained by input_parent_namespace."""
+    if sys.platform != "win32":
+        return os.open(
+            path.name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_descriptor,
+        )
+    import msvcrt
+
+    handle = open_windows_input_component(parent_descriptor, path.name, directory=False)
+    try:
+        return msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+    except BaseException:
+        import ctypes.wintypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+        kernel.CloseHandle(handle)
+        raise
+
+
+def open_input_descriptor(path: Path) -> int:
+    """Open a no-follow regular leaf through verified ancestry; exclude Windows writers."""
+    with input_parent_namespace(path) as (requested, parent):
+        return _open_input_leaf(requested, parent)
+
+
+@contextmanager
+def _input_binary_stream(path: Path, parent_descriptor):
+    """Keep descriptor ownership through stream construction, use and close."""
+    descriptor = _open_input_leaf(path, parent_descriptor)
+    try:
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            yield stream
+    finally:
+        os.close(descriptor)
 
 
 def read_input(path: Path, max_bytes: int = MAX_INPUT_BYTES) -> tuple[str, InputIdentity]:
+    if max_bytes < 0 or max_bytes > MAX_INPUT_BYTES:
+        raise ConverterError("Input byte budget is outside its supported range")
     try:
-        resolved = path.resolve(strict=True)
-    except OSError as exc:
-        raise ConverterError(f"Cannot access input file '{path}': {exc}") from exc
-    try:
-        expected = resolved.stat()
-        if not stat.S_ISREG(expected.st_mode):
-            raise ConverterError(f"Input is not a regular file: {resolved}")
-        descriptor = open_input_descriptor(resolved)
-        with os.fdopen(descriptor, "rb") as stream:
+        with input_parent_namespace(path) as (resolved, parent), ExitStack() as stack:
+            expected = (
+                None
+                if sys.platform == "win32"
+                else os.stat(resolved.name, dir_fd=parent, follow_symlinks=False)
+            )
+            if expected is not None and not stat.S_ISREG(expected.st_mode):
+                raise ConverterError(f"Input is not a regular file: {resolved}")
+            stream = stack.enter_context(_input_binary_stream(resolved, parent))
             opened = os.fstat(stream.fileno())
             if not stat.S_ISREG(opened.st_mode):
                 raise ConverterError(f"Input is not a regular file: {resolved}")
-            if (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino):
+            if expected is not None and (opened.st_dev, opened.st_ino) != (
+                expected.st_dev,
+                expected.st_ino,
+            ):
                 raise ConverterError("Input identity changed before reading")
             if opened.st_size > max_bytes:
                 raise ConverterError(
@@ -706,7 +927,14 @@ def read_input(path: Path, max_bytes: int = MAX_INPUT_BYTES) -> tuple[str, Input
                 )
             data = stream.read(max_bytes + 1)
             after = os.fstat(stream.fileno())
-            named = resolved.stat()
+            if sys.platform == "win32":
+                named_fd = _open_input_leaf(resolved, parent)
+                try:
+                    named = os.fstat(named_fd)
+                finally:
+                    os.close(named_fd)
+            else:
+                named = os.stat(resolved.name, dir_fd=parent, follow_symlinks=False)
             if (
                 (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
                 != (
@@ -723,7 +951,7 @@ def read_input(path: Path, max_bytes: int = MAX_INPUT_BYTES) -> tuple[str, Input
         if len(data) > max_bytes:
             raise ConverterError(f"Input exceeds the {max_bytes:,} byte limit while reading")
     except OSError as exc:
-        raise ConverterError(f"Cannot read input file '{resolved}': {exc}") from exc
+        raise ConverterError(f"Cannot read input file '{path}': {exc}") from exc
     if b"\x00" in data:
         raise ConverterError(f"Input contains NUL bytes and is not a text ruleset: {resolved}")
     try:
@@ -1359,6 +1587,7 @@ def atomic_write_bytes(
 def atomic_write_text(
     path: Path, text: str, force: bool = False, *, protected_inputs: Sequence[InputIdentity] = ()
 ) -> Path:
+    require_text_without_nul(text)
     return atomic_write_bytes(
         path, text.encode("utf-8"), force=force, protected_inputs=protected_inputs
     )
@@ -1583,11 +1812,15 @@ class RuleParser:
     def parse_text(
         self, text: str, source: str = "<memory>", *, byte_count: int | None = None
     ) -> ParseResult:
+        require_text_without_nul(text, source)
         if len(text) > MAX_INPUT_BYTES:
             raise ConverterError("Input exceeds its character budget")
-        size = len(text.encode("utf-8")) if byte_count is None else byte_count
-        if size > MAX_INPUT_BYTES:
+        actual_size = len(text.encode("utf-8"))
+        size = actual_size if byte_count is None else byte_count
+        if actual_size > MAX_INPUT_BYTES or size > MAX_INPUT_BYTES:
             raise ConverterError("Input exceeds its byte budget")
+        if size < actual_size:
+            raise ConverterError("Declared input byte count cannot understate its UTF-8 text")
         result = ParseResult(
             source=source,
             byte_count=size,
@@ -2093,6 +2326,29 @@ def infer_dialect(rule: Rule) -> str:
     return "snort2"
 
 
+def normalize_source_dialect(value: str | None) -> str:
+    if value is None:
+        return "auto"
+    if not isinstance(value, str):
+        raise ConverterError("Source dialect must be auto, snort2, snort3, or suricata")
+    normalized = value.strip().lower()
+    if normalized not in {"auto", "snort2", "snort3", "suricata"}:
+        raise ConverterError(f"Unsupported source dialect: {value!r}")
+    return normalized
+
+
+def resolve_source_dialect(rule: Rule, value: str | None) -> str:
+    normalized = normalize_source_dialect(value)
+    return infer_dialect(rule) if normalized == "auto" else normalized
+
+
+def concrete_source_dialect(value: str) -> str:
+    normalized = normalize_source_dialect(value)
+    if normalized == "auto":
+        raise ConverterError("An option-only transformation requires an explicit source dialect")
+    return normalized
+
+
 def semantic_fingerprint(rule: Rule) -> str:
     normalized = {
         "header": rule.canonical_header(),
@@ -2130,6 +2386,7 @@ def snort2_content_buffer_indexes(
 def transform_snort2_to_snort3(
     options: Sequence[RuleOption], backward_buffers: frozenset[str] | None = None
 ) -> list[RuleOption]:
+    validate_options_text(options)
     associations = snort2_content_buffer_indexes(options, backward_buffers)
     associated_buffers = set(associations.values())
     transformed: list[RuleOption] = []
@@ -2222,6 +2479,8 @@ def transform_snort2_to_snort3(
 def transform_sticky_to_snort2(
     options: Sequence[RuleOption], source_dialect: str
 ) -> list[RuleOption]:
+    source_dialect = concrete_source_dialect(source_dialect)
+    validate_options_text(options)
     if source_dialect == "suricata":
         options = [
             RuleOption(LEGACY_TO_DOTTED_BUFFER[option.key], option.value, option.raw, option.origin)
@@ -2457,9 +2716,127 @@ def mapped_suricata_sip_value(option: RuleOption) -> str | None:
     return value.upper() if re.fullmatch(grammar, value) else None
 
 
+def content_byte_length(value: str | None) -> int:
+    """Count supported literal/hex content bytes without interpreting engine escapes."""
+    if value is None or len(value) < 2 or value[0] != '"' or value[-1] != '"':
+        raise ConverterError("Fast-pattern chopping requires non-negated quoted content")
+    text = value[1:-1]
+    count, index = 0, 0
+    while index < len(text):
+        if text[index] == "|":
+            end = text.find("|", index + 1)
+            if end < 0:
+                raise ConverterError("Fast-pattern content has an unterminated hex segment")
+            digits = "".join(text[index + 1 : end].split())
+            if not digits or len(digits) % 2 or not re.fullmatch(r"[0-9A-Fa-f]+", digits):
+                raise ConverterError("Fast-pattern content has an unsupported hex segment")
+            count += len(digits) // 2
+            index = end + 1
+        elif text[index] == "\\":
+            if index + 1 >= len(text) or text[index + 1] not in '\\";|:':
+                raise ConverterError("Fast-pattern content escape has no proven byte length")
+            count += 1
+            index += 2
+        else:
+            count += len(text[index].encode("utf-8"))
+            index += 1
+    return count
+
+
+def fast_pattern_pair(offset: str | None, length: str | None, content: RuleOption) -> str:
+    try:
+        first = bounded_decimal(offset or "", maximum=65535)
+        size = bounded_decimal(length or "", maximum=65535)
+    except ValueError as exc:
+        raise ConverterError(
+            "Fast-pattern offset/length require bounded unsigned integers"
+        ) from exc
+    if size < 1 or first + size > content_byte_length(content.value):
+        raise ConverterError("Fast-pattern chop must be nonempty and fit its associated content")
+    return f"{first},{size}"
+
+
+def normalized_fast_pattern_options(
+    options: Sequence[RuleOption], source_dialect: str
+) -> list[RuleOption]:
+    """Validate complete content groups and emit one marker for a supported chop."""
+    source_dialect = concrete_source_dialect(source_dialect)
+    validate_options_text(options)
+    output: list[RuleOption] = []
+    backwards = (
+        frozenset(LEGACY_TO_DOTTED_BUFFER) - {"file_data"}
+        if source_dialect == "snort2"
+        else SURICATA_BACKWARD_BUFFERS
+        if source_dialect == "suricata"
+        else frozenset()
+    )
+    index, selected = 0, 0
+    while index < len(options):
+        content = options[index]
+        if content.key != "content":
+            if content.key in {"fast_pattern", "fast_pattern_offset", "fast_pattern_length"}:
+                raise ConverterError("Fast-pattern modifiers require an associated content group")
+            output.append(content)
+            index += 1
+            continue
+        end = index + 1
+        while end < len(options) and options[end].key in CONTENT_MODIFIERS | backwards:
+            end += 1
+        group = options[index + 1 : end]
+        markers = [o for o in group if o.key == "fast_pattern"]
+        offsets = [i for i, o in enumerate(group) if o.key == "fast_pattern_offset"]
+        lengths = [i for i, o in enumerate(group) if o.key == "fast_pattern_length"]
+        if len(markers) > 1:
+            raise ConverterError("A content group cannot have competing fast-pattern markers")
+        value: str | None = None
+        has_pair = bool(offsets or lengths)
+        if has_pair:
+            if len(offsets) != 1 or len(lengths) != 1 or lengths[0] != offsets[0] + 1:
+                raise ConverterError(
+                    "Fast-pattern offset requires one adjacent length in its content group"
+                )
+            if markers and markers[0].value is not None:
+                raise ConverterError(
+                    "A valued fast-pattern marker cannot coexist with offset/length"
+                )
+            if any(o.key in {"width", "endian"} for o in group):
+                raise ConverterError("Fast-pattern chopping of widened content is not supported")
+            value = fast_pattern_pair(group[offsets[0]].value, group[lengths[0]].value, content)
+        elif markers and markers[0].value is not None:
+            if source_dialect == "snort3":
+                raise ConverterError("Snort 3 requires a bare marker with separate chop modifiers")
+            original = markers[0].value.strip()
+            if original != "only":
+                parts = original.split(",")
+                if len(parts) != 2:
+                    raise ConverterError("Unsupported fast-pattern marker value")
+                value = fast_pattern_pair(parts[0], parts[1], content)
+        if markers or has_pair:
+            selected += 1
+            if selected > 1:
+                raise ConverterError("A rule cannot select multiple explicit fast-pattern contents")
+        output.append(content)
+        emitted = False
+        for option in group:
+            if value is not None and option.key in {
+                "fast_pattern",
+                "fast_pattern_offset",
+                "fast_pattern_length",
+            }:
+                if not emitted:
+                    output.append(RuleOption("fast_pattern", value, option.raw, option.origin))
+                    emitted = True
+            else:
+                output.append(option)
+        index = end
+    return output
+
+
 def transform_to_suricata(
     options: Sequence[RuleOption], source_dialect: str, rule_protocol: str
 ) -> list[RuleOption]:
+    source_dialect = concrete_source_dialect(source_dialect)
+    options = normalized_fast_pattern_options(options, source_dialect)
     if sip_relative_cursor_unsafe(options):
         raise ConverterError(
             "SIP shorthand cannot preserve a relative payload cursor or displaced pattern modifier"
@@ -2564,14 +2941,30 @@ def transform_to_suricata(
 
 
 def transform_to_snort3(options: Sequence[RuleOption], source_dialect: str) -> list[RuleOption]:
+    source_dialect = concrete_source_dialect(source_dialect)
+    validate_options_text(options)
     if source_dialect == "snort2":
-        return transform_snort2_to_snort3(options)
+        options = transform_snort2_to_snort3(options)
     if source_dialect == "suricata" and any(
         option.key in SURICATA_BACKWARD_BUFFERS for option in options
     ):
-        return transform_snort2_to_snort3(options, SURICATA_BACKWARD_BUFFERS)
+        options = transform_snort2_to_snort3(options, SURICATA_BACKWARD_BUFFERS)
     transformed: list[RuleOption] = []
     for option in options:
+        if source_dialect != "snort3" and option.key == "fast_pattern" and option.value is not None:
+            parts = option.value.split(",")
+            if len(parts) != 2:
+                raise ConverterError(
+                    "Snort 3 fast-pattern conversion requires a proven numeric chop"
+                )
+            transformed.extend(
+                [
+                    RuleOption("fast_pattern", None, option.raw, option.origin),
+                    RuleOption("fast_pattern_offset", parts[0].strip(), option.raw, option.origin),
+                    RuleOption("fast_pattern_length", parts[1].strip(), option.raw, option.origin),
+                ]
+            )
+            continue
         mapped = DOTTED_TO_LEGACY_BUFFER.get(option.key)
         if mapped is None:
             transformed.append(option)
@@ -2645,6 +3038,7 @@ def render_rule(
     *,
     allow_detached_rules: bool = False,
 ) -> str:
+    validate_rule_text(rule)
     if MAX_PARSED_RULES < 1:
         raise ConverterError("Conversion rule count budget exceeded")
     # The parser computes this summary once over the immutable complete context.
@@ -2663,7 +3057,7 @@ def render_rule(
         raise ConverterError(
             "Complete parse provenance is required; no partial rule output is safe"
         )
-    dialect = source_dialect or infer_dialect(rule)
+    dialect = resolve_source_dialect(rule, source_dialect)
     if dialect == "ambiguous":
         if target == "ambiguous":
             return f"{rule.canonical_header()} ({' '.join(option.rendered() for option in rule.options)})"
@@ -2722,7 +3116,17 @@ def render_rule(
 def compatibility_diagnostics(
     rule: Rule, target: str, strict: bool, source_dialect: str
 ) -> tuple[list[Diagnostic], Counter[str]]:
+    validate_rule_text(rule)
+    source_dialect = resolve_source_dialect(rule, source_dialect)
+    if source_dialect == "ambiguous":
+        raise ConverterError("Ambiguous buffer placement requires an explicit source dialect")
     diagnostics: list[Diagnostic] = []
+    try:
+        normalized_fast_pattern_options(rule.options, source_dialect)
+    except ConverterError as exc:
+        diagnostics.append(
+            option_diagnostic(rule, "error", "UNSAFE_FAST_PATTERN_MAPPING", str(exc))
+        )
     unverified: Counter[str] = Counter()
     if rule.action not in TARGET_ACTIONS[target]:
         diagnostics.append(
@@ -3103,6 +3507,9 @@ def convert_rules(
     That acknowledgement never overrides errors retained from a real parse. It
     does not relax dialect or semantic compatibility checks.
     """
+    source_dialect = normalize_source_dialect(source_dialect)
+    if target not in TARGET_ACTIONS:
+        raise ConverterError(f"Unsupported conversion target: {target}")
     result = ConversionResult(target=target)
     parsed = rules if isinstance(rules, ParseResult) else None
     source_rules = parsed.rules if parsed is not None else rules
@@ -3118,7 +3525,7 @@ def convert_rules(
     for rule in source_rules:
         if len(result.diagnostics) >= MAX_DIAGNOSTICS:
             raise ConverterError("Diagnostic budget exceeded; no partial output is safe")
-        dialect = infer_dialect(rule) if source_dialect == "auto" else source_dialect
+        dialect = resolve_source_dialect(rule, source_dialect)
         if dialect == "ambiguous":
             result.diagnostics.append(
                 option_diagnostic(
@@ -3163,7 +3570,7 @@ def convert_rules(
 
 def rule_to_dict(rule: Rule, *, allow_detached_rules: bool = False) -> dict[str, Any]:
     dialect = infer_dialect(rule)
-    canonical_rule = render_rule(rule, dialect, dialect, allow_detached_rules=allow_detached_rules)
+    canonical_rule = render_rule(rule, dialect, allow_detached_rules=allow_detached_rules)
     return {
         "index": rule.index,
         "source": rule.source,
@@ -3462,6 +3869,7 @@ def preceding_pattern(rule: Rule, option_index: int) -> RuleOption | None:
 
 
 def panorama_option_checks(rule: Rule) -> list[Diagnostic]:
+    validate_rule_text(rule)
     diagnostics: list[Diagnostic] = []
     if infer_dialect(rule) == "ambiguous":
         return [

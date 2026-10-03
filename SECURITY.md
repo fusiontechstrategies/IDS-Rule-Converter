@@ -156,10 +156,10 @@ reader's overlap check must pass. Header validation closes each member without
 reading or decompressing its entity.
 Existing extraction size, decoder, path and object-count limits still apply.
 
-File parsing checks the actual opened descriptor against the named file, requires
+File parsing checks the actual opened descriptor against its retained parent, requires
 a regular bounded stable snapshot, and retains its path and device/inode identity
 for provenance and output protection. Output commands never resolve the original
-input alias again. They reject hardlink, case and Unicode-normalization aliases and
+input pathname again. They reject hardlink, case and Unicode-normalization aliases and
 recheck input identity immediately before forced replacement in a trusted output
 directory. Case/Unicode spelling checks are deliberately conservative even on a
 case-sensitive filesystem. Concurrent mutation by the same trusted user is outside
@@ -174,6 +174,26 @@ retains a SHA-256 of its exact raw bytes, propagated to machine reports and
 generated provenance. POSIX retains descriptor/identity/size/timestamp checks;
 the digest identifies the bytes consumed, but is not a cross-process lock or an
 authenticity proof. Files may change after the read completes.
+
+Input admission preserves the lexical path, retains each no-follow ancestor and
+uses a single relative name for final lookup. POSIX reads use `dir_fd`, no-follow
+and nonblocking opens; Windows uses `NtCreateFile` with retained `RootDirectory`,
+one-component names, no reparse processing, and read-only sharing. Parent trust
+checks refuse known other-principal mutation authority. No existing owner or ACL
+is repaired. Root, the current user, SYSTEM/Administrators/TrustedInstaller and
+historically retained local security authority remain trusted boundaries; these
+checks are not a same-user or administrator sandbox. POSIX mode checks do not
+attest arbitrary remote filesystems or hidden historical ACL authority. Inputs
+must be regular local files in a trusted namespace; unsupported Windows UNC/device
+paths and user-selected symbolic/reparse aliases are refused. The existing trusted
+macOS system alias exception is unchanged. Short-name paths stay lexical.
+
+The four final input/render gaps were also present in the earlier 9079435,
+061703d and bf617eb source revisions. Verification of this maintenance correction
+uses ordinary functional fixtures, corrected-code admission refusals, existing
+suites and independent source/API review. No runtime ancestor-swap or baseline
+bypass demonstration is claimed. Source review, native engine validation and the
+final independent Cloud scan are separate forms of evidence.
 
 Library conversion accepts ParseResult and carries immutable complete-parse
 diagnostics on parser-produced ParseResult and Rule objects. A later malformed record rejects
