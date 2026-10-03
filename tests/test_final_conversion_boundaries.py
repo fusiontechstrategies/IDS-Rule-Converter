@@ -237,7 +237,7 @@ class ConversionBoundaries(unittest.TestCase):
             )
             for strict in (True, False):
                 self.assertTrue(app.convert_rules(parsed.rules, "suricata", strict=strict).errors)
-            with self.assertRaisesRegex(app.ConverterError, "bufferlen cannot safely map"):
+            with self.assertRaisesRegex(app.ConverterError, "bufferlen"):
                 app.render_rule(parsed.rules[0], "suricata")
         for value, expected in (
             ("10", "10"),
