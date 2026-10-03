@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import unittest
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -249,6 +250,70 @@ class InputRenderFour(unittest.TestCase):
         self.assertFalse(parsed.errors)
         self.assertIn('content:"|00|a";', app.render_rule(parsed.rules[0], "suricata"))
         self.assertNotIn("\x00", app.rule_to_dict(parsed.rules[0])["canonical_rule"])
+
+    def test_stream_construction_failure_closes_actual_leaf_descriptor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory).resolve() / "ordinary.rules"
+            source.write_text(RULE, encoding="utf-8")
+            opened = []
+            real_open = app._open_input_leaf
+
+            def tracked(path, parent):
+                descriptor = real_open(path, parent)
+                opened.append(descriptor)
+                return descriptor
+
+            with (
+                patch.object(app, "_open_input_leaf", tracked),
+                patch.object(os, "fdopen", side_effect=OSError("Fixture constructor refused")),
+                self.assertRaises(app.ConverterError),
+            ):
+                app.read_input(source)
+            self.assertEqual(len(opened), 1)
+            with self.assertRaises(OSError):
+                os.fstat(opened[0])
+
+    def test_stream_processing_failure_closes_actual_descriptor_exactly_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory).resolve() / "ordinary.rules"
+            source.write_text(RULE, encoding="utf-8")
+            real_close = os.close
+            with app.input_parent_namespace(source) as (requested, parent):
+                with patch.object(os, "close", wraps=real_close) as close:
+                    with (
+                        self.assertRaisesRegex(RuntimeError, "Fixture processing refused"),
+                        app._input_binary_stream(requested, parent) as stream,
+                    ):
+                        descriptor = stream.fileno()
+                        self.assertEqual(stream.read(), RULE.encode())
+                        raise RuntimeError("Fixture processing refused")
+                    close.assert_called_once_with(descriptor)
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
+
+    @unittest.skipIf(os.name == "nt", "POSIX descriptors; native Windows leaf cases execute")
+    def test_byte_budget_refusal_closes_all_actual_retained_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory).resolve() / "ordinary.rules"
+            source.write_text(RULE, encoding="utf-8")
+            retained = []
+            original = app._input_directory_descriptor
+
+            @contextmanager
+            def tracked(*args, **kwargs):
+                with original(*args, **kwargs) as descriptor:
+                    retained.append(descriptor)
+                    yield descriptor
+
+            with (
+                patch.object(app, "_input_directory_descriptor", tracked),
+                self.assertRaises(app.ConverterError),
+            ):
+                app.read_input(source, max_bytes=1)
+            self.assertGreaterEqual(len(retained), 2)
+            for descriptor in retained:
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
 
 
 if __name__ == "__main__":

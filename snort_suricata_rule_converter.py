@@ -787,6 +787,16 @@ def validate_windows_input_component(handle, *, directory: bool) -> None:
 
 
 @contextmanager
+def _input_directory_descriptor(name: str, flags: int, *, parent: int | None = None):
+    """Own one descriptor explicitly, including failures during namespace admission."""
+    descriptor = os.open(name, flags, dir_fd=parent)
+    try:
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
 def input_parent_namespace(path: Path):
     """Retain no-follow lexical ancestry for all admission and snapshot operations."""
     requested = canonical_system_path(path.expanduser().absolute())
@@ -814,16 +824,16 @@ def input_parent_namespace(path: Path):
             if not hasattr(os, "O_NOFOLLOW") or os.open not in os.supports_dir_fd:
                 raise ConverterError("Input snapshots require no-follow directory-relative opens")
             flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-            parent = os.open(requested.anchor, flags)
-            stack.callback(os.close, parent)
+            parent = stack.enter_context(_input_directory_descriptor(requested.anchor, flags))
             for part in requested.parent.parts[1:]:
                 info = os.fstat(parent)
                 if info.st_uid not in {0, os.geteuid()} or (
                     stat.S_IMODE(info.st_mode) & 0o022 and not info.st_mode & stat.S_ISVTX
                 ):
                     raise ConverterError("Input ancestry can be replaced by another user")
-                parent = os.open(part, flags, dir_fd=parent)
-                stack.callback(os.close, parent)
+                parent = stack.enter_context(
+                    _input_directory_descriptor(part, flags, parent=parent)
+                )
             info = os.fstat(parent)
             if info.st_uid not in {0, os.geteuid()} or (
                 stat.S_IMODE(info.st_mode) & 0o022 and not info.st_mode & stat.S_ISVTX
@@ -860,6 +870,17 @@ def open_input_descriptor(path: Path) -> int:
         return _open_input_leaf(requested, parent)
 
 
+@contextmanager
+def _input_binary_stream(path: Path, parent_descriptor):
+    """Keep descriptor ownership through stream construction, use and close."""
+    descriptor = _open_input_leaf(path, parent_descriptor)
+    try:
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            yield stream
+    finally:
+        os.close(descriptor)
+
+
 def read_input(path: Path, max_bytes: int = MAX_INPUT_BYTES) -> tuple[str, InputIdentity]:
     if max_bytes < 0 or max_bytes > MAX_INPUT_BYTES:
         raise ConverterError("Input byte budget is outside its supported range")
@@ -872,8 +893,7 @@ def read_input(path: Path, max_bytes: int = MAX_INPUT_BYTES) -> tuple[str, Input
             )
             if expected is not None and not stat.S_ISREG(expected.st_mode):
                 raise ConverterError(f"Input is not a regular file: {resolved}")
-            descriptor = _open_input_leaf(resolved, parent)
-            stream = stack.enter_context(os.fdopen(descriptor, "rb"))
+            stream = stack.enter_context(_input_binary_stream(resolved, parent))
             opened = os.fstat(stream.fileno())
             if not stat.S_ISREG(opened.st_mode):
                 raise ConverterError(f"Input is not a regular file: {resolved}")
