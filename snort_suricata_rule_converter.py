@@ -18,9 +18,11 @@ import os
 import re
 import ssl
 import stat
+import struct
 import subprocess  # nosec B404
 import sys
 import tarfile
+import time
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -32,7 +34,7 @@ from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, BinaryIO
 
 APP_NAME = "IDS Rule Converter"
@@ -52,6 +54,7 @@ MAX_DIAGNOSTICS = 10_000
 MAX_ARCHIVE_PATH_DEPTH = 32
 MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 20_000
+MAX_ZIP_DIRECTORY_BYTES = 8 * 1024 * 1024
 MAX_EXTRACTED_BYTES = 512 * 1024 * 1024
 MAX_EXTRACTED_FILE_BYTES = 128 * 1024 * 1024
 
@@ -202,6 +205,13 @@ LEGACY_TO_DOTTED_BUFFER = {
 }
 DOTTED_TO_LEGACY_BUFFER = {value: key for key, value in LEGACY_TO_DOTTED_BUFFER.items()}
 
+# Shared explicit selectors change the payload buffer independently of backward
+# Snort 2 HTTP content modifiers. Keep all cursor and restoration paths aligned.
+EXPLICIT_PAYLOAD_SELECTORS = frozenset(
+    {"pkt_data", "raw_data", "file_data", "base64_data", "dce_stub_data"}
+)
+SNORT3_ONLY_OPTIONS = frozenset({"ber_data", "ber_skip"})
+
 SNORT_TO_SURICATA_OPTION = {
     "sip_method": "sip.method",
     "sip_stat_code": "sip.stat_code",
@@ -246,8 +256,6 @@ COMMON_OPTIONS = (
         "ack",
         "base64_data",
         "base64_decode",
-        "ber_data",
-        "ber_skip",
         "bufferlen",
         "bsize",
         "byte_extract",
@@ -1900,6 +1908,8 @@ def infer_dialect(rule: Rule) -> str:
         return "snort3"
     if rule.action in {"config", "rejectboth", "rejectdst", "rejectsrc"}:
         return "suricata"
+    if any(option.key in SNORT3_ONLY_OPTIONS for option in rule.options):
+        return "snort3"
     if any(option.origin == "content-inline" for option in rule.options):
         return "snort3"
     if any("." in option.key for option in rule.options):
@@ -1963,14 +1973,18 @@ def transform_snort2_to_snort3(options: Sequence[RuleOption]) -> list[RuleOption
     # Generated selector restoration does not restore the source pattern cursor.
     # Keep its buffer provenance across flow, metadata and other neutral options.
     cursor_buffer = "pkt_data"
-    cursor_preserved = True
+    cursor_preserved = False
     pattern_displaced = False
+    pattern_incoming_cursor_preserved = False
     for index, option in enumerate(options):
         if index in associated_buffers:
             continue
         if option.key == "content":
             buffer_index = associations.get(index)
             desired = options[buffer_index].key if buffer_index is not None else payload_buffer
+            pattern_incoming_cursor_preserved = (
+                cursor_buffer == desired and active_buffer == desired and cursor_preserved
+            )
             cursor = index + 1
             relative_pattern = False
             while cursor < len(options) and (
@@ -1978,7 +1992,7 @@ def transform_snort2_to_snort3(options: Sequence[RuleOption]) -> list[RuleOption
             ):
                 relative_pattern |= options[cursor].key in {"distance", "within"}
                 cursor += 1
-            if relative_pattern and (cursor_buffer != desired or not cursor_preserved):
+            if relative_pattern and not pattern_incoming_cursor_preserved:
                 raise ConverterError(
                     "Relative content after a backward Snort 2 content modifier cannot preserve its cursor"
                 )
@@ -1992,16 +2006,22 @@ def transform_snort2_to_snort3(options: Sequence[RuleOption]) -> list[RuleOption
                 cursor_buffer = desired
                 cursor_preserved = True
             continue
-        if option.key in {"file_data", "pkt_data", "raw_data", "base64_data"}:
+        if option.key in EXPLICIT_PAYLOAD_SELECTORS:
             transformed.append(option)
             active_buffer = option.key
             payload_buffer = option.key
             cursor_buffer = option.key
-            cursor_preserved = True
+            cursor_preserved = False
+            pattern_displaced = True
+            pattern_incoming_cursor_preserved = False
             continue
         if pattern_displaced and option.key in DISPLACED_PATTERN_MODIFIERS:
             raise ConverterError(
                 "Displaced pattern modifier after a backward Snort 2 content group cannot preserve its pattern"
+            )
+        if option.key in {"distance", "within"} and not pattern_incoming_cursor_preserved:
+            raise ConverterError(
+                "Relative content after a backward Snort 2 content modifier cannot preserve its cursor"
             )
         # A backward modifier belongs only to its source content group. Restore
         # before any subsequent non-modifier instead of listing payload consumers.
@@ -2039,23 +2059,97 @@ def transform_sticky_to_snort2(
 ) -> list[RuleOption]:
     transformed: list[RuleOption] = []
     active_modifier: str | None = None
-    for option in options:
+    selected_buffer = "pkt_data"
+    cursor_buffer = "pkt_data"
+    cursor_preserved = False
+    pattern_preserved = False
+    pattern_incoming_cursor_preserved = False
+    payload_operations = {
+        "pcre",
+        "byte_extract",
+        "byte_jump",
+        "byte_math",
+        "byte_test",
+        "isdataat",
+        "base64_decode",
+        "asn1",
+        "bufferlen",
+    }
+    for index, option in enumerate(options):
         key = option.key
         is_sticky = key in DOTTED_TO_LEGACY_BUFFER or (
             source_dialect == "snort3" and key in LEGACY_TO_DOTTED_BUFFER
         )
         if is_sticky:
             legacy = DOTTED_TO_LEGACY_BUFFER.get(key, key)
+            if option.value is not None:
+                raise ConverterError(
+                    f"Sticky buffer '{option.name}' argument has no proven Snort 2 equivalent"
+                )
             if legacy == "file_data":
                 transformed.append(RuleOption("file_data", option.value, option.raw))
                 active_modifier = None
+                cursor_buffer = legacy
             else:
                 active_modifier = legacy
+            # Selection cannot create a match cursor or preserve modifiers of
+            # a pattern selected before it, even when selecting the same buffer.
+            cursor_preserved = False
+            pattern_preserved = False
+            pattern_incoming_cursor_preserved = False
+            selected_buffer = legacy
             continue
-        if key in {"pkt_data", "raw_data"}:
+        if key in EXPLICIT_PAYLOAD_SELECTORS:
+            if option.value is not None:
+                raise ConverterError(f"Payload selector '{option.name}' takes no arguments")
             active_modifier = None
+            selected_buffer = key
+            cursor_buffer = key
+            cursor_preserved = False
+            pattern_preserved = False
+            pattern_incoming_cursor_preserved = False
             transformed.append(option)
             continue
+        if key == "content":
+            # A delayed modifier belongs to this pattern, not to the post-match
+            # cursor this pattern may establish. Neutral options cannot hide it.
+            pattern_incoming_cursor_preserved = (
+                cursor_buffer == selected_buffer and cursor_preserved
+            )
+            cursor = index + 1
+            relative = False
+            while cursor < len(options) and options[cursor].key in CONTENT_MODIFIERS:
+                relative |= options[cursor].key in {"distance", "within"}
+                cursor += 1
+            if relative and not pattern_incoming_cursor_preserved:
+                raise ConverterError(
+                    "Snort 2 downgrade cannot preserve relative content across buffer transitions"
+                )
+            if option.value is not None and not option.value.lstrip().startswith("!"):
+                cursor_buffer = selected_buffer
+                cursor_preserved = True
+            pattern_preserved = True
+        elif key in DISPLACED_PATTERN_MODIFIERS and not pattern_preserved:
+            raise ConverterError(
+                "Snort 2 downgrade cannot preserve a content modifier after a buffer transition"
+            )
+        elif key in {"distance", "within"} and not pattern_incoming_cursor_preserved:
+            raise ConverterError(
+                "Snort 2 downgrade cannot preserve the incoming cursor of relative content"
+            )
+        elif key in payload_operations:
+            if active_modifier is not None:
+                raise ConverterError(
+                    f"Cannot safely express {option.name} under sticky buffer '{active_modifier}' in Snort 2"
+                )
+            relative = option.value is not None and (
+                (key == "pcre" and "R" in pcre_flags(option.value))
+                or re.search(r"\brelative(?:_offset)?\b", option.value.lower()) is not None
+            )
+            if relative and (cursor_buffer != selected_buffer or not cursor_preserved):
+                raise ConverterError(
+                    "Snort 2 downgrade cannot preserve the relative payload cursor"
+                )
         transformed.append(option)
         if key == "content" and active_modifier is not None:
             transformed.append(RuleOption(active_modifier, None, active_modifier))
@@ -2185,6 +2279,12 @@ def sip_relative_cursor_unsafe(options: Sequence[RuleOption]) -> bool:
     return False
 
 
+def mapped_suricata_sip_value(option: RuleOption) -> str | None:
+    value = unquote(option.value or "")
+    grammar = r"[A-Za-z]+" if option.key == "sip_method" else r"(?:[1-9]|[1-9][0-9]{2})"
+    return value.upper() if re.fullmatch(grammar, value) else None
+
+
 def transform_to_suricata(
     options: Sequence[RuleOption], source_dialect: str, rule_protocol: str
 ) -> list[RuleOption]:
@@ -2250,10 +2350,12 @@ def transform_to_suricata(
                 index += 1
         elif key == "fast_pattern_length":
             pass
-        elif key in SNORT_TO_SURICATA_OPTION and option.value is not None:
+        elif key in SNORT_TO_SURICATA_OPTION:
+            value = mapped_suricata_sip_value(option)
+            if value is None:
+                raise ConverterError(f"{option.name} has no safe single-value Suricata mapping")
             mapped = SNORT_TO_SURICATA_OPTION[key]
             transformed.append(RuleOption(mapped, None, option.raw, option.origin))
-            value = unquote(option.value).upper()
             transformed.append(RuleOption("content", f'"{value}"', option.raw))
             if key == "sip_stat_code" and len(value) == 1:
                 transformed.append(RuleOption("startswith", None, "startswith"))
@@ -2274,13 +2376,10 @@ def transform_to_suricata(
             )
         if key not in SNORT_TO_SURICATA_OPTION and transformed:
             selected = transformed[-1]
-            if selected.key in DOTTED_TO_LEGACY_BUFFER or selected.key in {
-                "pkt_data",
-                "raw_data",
-                "file.data",
-                "file_data",
-                "base64_data",
-            }:
+            if (
+                selected.key in DOTTED_TO_LEGACY_BUFFER
+                or selected.key in EXPLICIT_PAYLOAD_SELECTORS
+            ):
                 active_buffer = selected
         index += 1
     return transformed
@@ -2305,6 +2404,14 @@ def render_rule(rule: Rule, target: str, source_dialect: str | None = None) -> s
         if target == "ambiguous":
             return f"{rule.canonical_header()} ({' '.join(option.rendered() for option in rule.options)})"
         raise ConverterError("Ambiguous buffer placement requires an explicit source dialect")
+    if target not in TARGET_ACTIONS:
+        raise ConverterError(f"Unsupported conversion target: {target}")
+    # Preserve the documented non-strict unknown-keyword path, but never bypass
+    # known hard compatibility failures through this importable renderer.
+    diagnostics, _ = compatibility_diagnostics(rule, target, False, dialect)
+    errors = [item.message for item in diagnostics if item.severity == "error"]
+    if errors:
+        raise ConverterError("; ".join(errors))
     if target == "snort3":
         options = transform_to_snort3(rule.options, dialect)
         rendered: list[str] = []
@@ -2540,8 +2647,7 @@ def compatibility_diagnostics(
                 )
             )
         elif target == "suricata" and key == "sip_method":
-            value = unquote(option.value or "")
-            if not re.fullmatch(r"[A-Za-z]+", value) or value.startswith("!"):
+            if mapped_suricata_sip_value(option) is None:
                 diagnostics.append(
                     option_diagnostic(
                         rule,
@@ -2552,8 +2658,7 @@ def compatibility_diagnostics(
                     )
                 )
         elif target == "suricata" and key == "sip_stat_code":
-            value = unquote(option.value or "")
-            if not re.fullmatch(r"(?:[1-9]|[1-9][0-9]{2})", value):
+            if mapped_suricata_sip_value(option) is None:
                 diagnostics.append(
                     option_diagnostic(
                         rule,
@@ -2614,7 +2719,7 @@ def compatibility_diagnostics(
                     option.name,
                 )
             )
-        elif target == "snort2" and key in {"endswith", "startswith"}:
+        elif target == "snort2" and key in {"endswith", "startswith"} | SNORT3_ONLY_OPTIONS:
             diagnostics.append(
                 option_diagnostic(
                     rule,
@@ -2630,44 +2735,30 @@ def compatibility_diagnostics(
         source_dialect in {"snort3", "suricata"}
         or any(option.value and option.key in LEGACY_TO_DOTTED_BUFFER for option in rule.options)
     ):
-        active_buffer: str | None = None
-        payload_noncontent = {
-            "byte_extract",
-            "byte_jump",
-            "byte_math",
-            "byte_test",
-            "isdataat",
-            "pcre",
-        }
         for option in rule.options:
             key = option.key
-            if key in DOTTED_TO_LEGACY_BUFFER or (
-                (source_dialect == "snort3" or option.value is not None)
-                and key in LEGACY_TO_DOTTED_BUFFER
-            ):
-                active_buffer = DOTTED_TO_LEGACY_BUFFER.get(key, key)
-                if option.value is not None:
-                    diagnostics.append(
-                        option_diagnostic(
-                            rule,
-                            "error",
-                            "UNSUPPORTED_BUFFER_ARGUMENT",
-                            f"Sticky buffer '{option.name}' argument has no proven Snort 2 equivalent",
-                            option.name,
-                        )
-                    )
-            elif key in {"pkt_data", "raw_data", "file_data", "file.data"}:
-                active_buffer = None
-            elif active_buffer is not None and key in payload_noncontent:
+            if (
+                key in DOTTED_TO_LEGACY_BUFFER
+                or (
+                    (source_dialect == "snort3" or option.value is not None)
+                    and key in LEGACY_TO_DOTTED_BUFFER
+                )
+            ) and option.value is not None:
                 diagnostics.append(
                     option_diagnostic(
                         rule,
                         "error",
-                        "UNSAFE_STICKY_BUFFER_DOWNGRADE",
-                        f"Cannot safely express {option.name} under sticky buffer '{active_buffer}' in Snort 2",
+                        "UNSUPPORTED_BUFFER_ARGUMENT",
+                        f"Sticky buffer '{option.name}' argument has no proven Snort 2 equivalent",
                         option.name,
                     )
                 )
+        try:
+            transform_sticky_to_snort2(rule.options, source_dialect)
+        except ConverterError as exc:
+            diagnostics.append(
+                option_diagnostic(rule, "error", "UNSAFE_STICKY_BUFFER_DOWNGRADE", str(exc))
+            )
     if target == "snort3" and source_dialect == "snort2":
         associated = set(snort2_content_buffer_indexes(rule.options).values())
         for index, option in enumerate(rule.options):
@@ -2849,6 +2940,16 @@ def ruleset_analysis(parsed: ParseResult) -> dict[str, Any]:
     }
 
 
+def sarif_artifact_uri(source: str) -> str:
+    """Encode filesystem identity, including Windows drive/UNC paths on any host."""
+    if re.match(r"^[A-Za-z]:[\\/]", source) or source.startswith("\\\\"):
+        return PureWindowsPath(source).as_uri()
+    path = PurePosixPath(source)
+    if path.is_absolute():
+        return path.as_uri()
+    return urllib.parse.quote(path.as_posix(), safe="/")
+
+
 def sarif_report(parsed: ParseResult, extra: Sequence[Diagnostic] = ()) -> dict[str, Any]:
     diagnostics = list(parsed.diagnostics) + list(extra)
     rules: dict[str, dict[str, Any]] = {}
@@ -2873,7 +2974,7 @@ def sarif_report(parsed: ParseResult, extra: Sequence[Diagnostic] = ()) -> dict[
             result["locations"] = [
                 {
                     "physicalLocation": {
-                        "artifactLocation": {"uri": Path(item.source).as_posix()},
+                        "artifactLocation": {"uri": sarif_artifact_uri(item.source)},
                         "region": {
                             "startLine": item.start_line,
                             "endLine": item.end_line or item.start_line,
@@ -2956,11 +3057,9 @@ def pattern_contexts(rule: Rule) -> list[tuple[RuleOption, str, bool]]:
         key = option.key
         if key in DOTTED_TO_LEGACY_BUFFER:
             active_context = DOTTED_TO_LEGACY_BUFFER[key]
-        elif (dialect == "snort3" and key in LEGACY_TO_DOTTED_BUFFER) or key in {
-            "pkt_data",
-            "raw_data",
-            "file_data",
-        }:
+        elif (
+            dialect == "snort3" and key in LEGACY_TO_DOTTED_BUFFER
+        ) or key in EXPLICIT_PAYLOAD_SELECTORS:
             active_context = key
         elif key == "content":
             cursor = index + 1
@@ -3593,11 +3692,117 @@ def validate_tar_archive(data: bytes) -> list[tarfile.TarInfo]:
     return members
 
 
+def preflight_zip_directory(data: bytes) -> tuple[int, int]:
+    """Bound and count directory records before ZipFile allocates any ZipInfo."""
+    if len(data) > MAX_DOWNLOAD_BYTES:
+        raise ConverterError("ZIP input exceeds the download byte limit")
+    end = data.rfind(b"PK\x05\x06", max(0, len(data) - 65557))
+    if end < 0 or end + 22 > len(data):
+        raise ConverterError("ZIP has no complete end-of-directory record")
+    _, disk, directory_disk, disk_count, count, size, offset, comment = struct.unpack_from(
+        "<4s4H2LH", data, end
+    )
+    if end + 22 + comment != len(data):
+        raise ConverterError("ZIP has a truncated comment or trailing data")
+    if disk != 0 or directory_disk != 0 or disk_count != count:
+        raise ConverterError("Multi-disk ZIP archives are not supported")
+    directory_end = end
+    zip64_position = None
+    zip64_offset = None
+    if end >= 20 and data[end - 20 : end - 16] == b"PK\x06\x07":
+        _, locator_disk, zip64_offset, disks = struct.unpack_from("<4sLQL", data, end - 20)
+        zip64_position = end - 20 - 56
+        if locator_disk != 0 or disks != 1 or zip64_position < 0:
+            raise ConverterError("Invalid or multi-disk ZIP64 locator")
+        values = struct.unpack_from("<4sQ2H2L4Q", data, zip64_position)
+        signature, record_size, _, _, z_disk, z_start, z_disk_count, z_count, z_size, z_offset = (
+            values
+        )
+        if signature != b"PK\x06\x06" or record_size != 44:
+            raise ConverterError(
+                "Only fixed-size single-disk ZIP64 directory records are supported"
+            )
+        if z_disk != 0 or z_start != 0 or z_disk_count != z_count:
+            raise ConverterError("Multi-disk ZIP64 archives are not supported")
+        for ordinary, wide, sentinel in (
+            (count, z_count, 0xFFFF),
+            (size, z_size, 0xFFFFFFFF),
+            (offset, z_offset, 0xFFFFFFFF),
+        ):
+            if ordinary != sentinel and ordinary != wide:
+                raise ConverterError("ZIP and ZIP64 directory metadata disagree")
+        count, size, offset = z_count, z_size, z_offset
+        directory_end = zip64_position
+    elif count == 0xFFFF or size == 0xFFFFFFFF or offset == 0xFFFFFFFF:
+        raise ConverterError("ZIP64 directory metadata is missing")
+    if count > MAX_ARCHIVE_ENTRIES:
+        raise ConverterError(f"Archive has {count:,} entries; limit is {MAX_ARCHIVE_ENTRIES:,}")
+    if size > MAX_ZIP_DIRECTORY_BYTES:
+        raise ConverterError("ZIP central directory exceeds its metadata byte limit")
+    start = directory_end - size
+    prefix_size = start - offset
+    if start < 0 or prefix_size < 0:
+        raise ConverterError("ZIP central-directory offsets are invalid")
+    if zip64_position is not None and zip64_offset != zip64_position - prefix_size:
+        raise ConverterError("ZIP64 locator does not identify its directory record")
+    position = start
+    actual = 0
+    while position < directory_end:
+        if actual >= MAX_ARCHIVE_ENTRIES:
+            raise ConverterError("ZIP actual entry count exceeds its entry limit")
+        if position + 46 > directory_end or data[position : position + 4] != b"PK\x01\x02":
+            raise ConverterError("ZIP central directory has an invalid or truncated record")
+        name_size, extra_size, comment_size = struct.unpack_from("<HHH", data, position + 28)
+        if struct.unpack_from("<H", data, position + 34)[0] != 0:
+            raise ConverterError("Multi-disk or extended-disk ZIP members are not supported")
+        position += 46 + name_size + extra_size + comment_size
+        if position > directory_end:
+            raise ConverterError("ZIP central-directory record exceeds its declared bounds")
+        actual += 1
+    if actual != count:
+        raise ConverterError("ZIP actual entry count differs from its directory metadata")
+    return actual, start
+
+
 def validate_zip_archive(data: bytes) -> list[zipfile.ZipInfo]:
+    count, directory_start = preflight_zip_directory(data)
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             members = archive.infolist()
-    except (zipfile.BadZipFile, OSError) as exc:
+            if len(members) != count or archive.start_dir != directory_start:
+                raise ConverterError("ZIP parser disagrees with the bounded directory preflight")
+            for member in members:
+                if member.volume != 0:
+                    raise ConverterError("Multi-disk ZIP members are not supported")
+                offset = member.header_offset
+                if (
+                    offset < 0
+                    or offset + 30 > directory_start
+                    or data[offset : offset + 4] != b"PK\x03\x04"
+                ):
+                    raise ConverterError("ZIP entry does not identify a bounded local-file header")
+                flags, compression = struct.unpack_from("<HH", data, offset + 6)
+                name_size, extra_size = struct.unpack_from("<HH", data, offset + 26)
+                entity_start = offset + 30 + name_size + extra_size
+                if (
+                    entity_start > directory_start
+                    or member.compress_size < 0
+                    or entity_start + member.compress_size > directory_start
+                    or flags != member.flag_bits
+                    or compression != member.compress_type
+                ):
+                    raise ConverterError("ZIP local-file metadata disagrees or exceeds its bounds")
+                if member.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}:
+                    raise ConverterError("ZIP entry uses an unsupported parameterized decoder")
+                if member.flag_bits & 0x1:
+                    raise ConverterError(
+                        f"Archive contains an encrypted entry: {member.filename!r}"
+                    )
+                # Validate the standard reader's name/overlap checks and close
+                # immediately. No compressed entity is read or extracted here.
+                with archive.open(member):
+                    pass
+    except (zipfile.BadZipFile, OSError, NotImplementedError, RuntimeError) as exc:
         raise ConverterError(f"Downloaded file is not a valid zip archive: {exc}") from exc
     if len(members) > MAX_ARCHIVE_ENTRIES:
         raise ConverterError(
@@ -3707,9 +3912,10 @@ def is_allowed_https_url(url: str, allowed_hosts: set[str]) -> bool:
 
 
 class RestrictedRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def __init__(self, allowed_hosts: set[str]) -> None:
+    def __init__(self, allowed_hosts: set[str], deadline: float | None = None) -> None:
         super().__init__()
         self.allowed_hosts = {item.lower() for item in allowed_hosts}
+        self.deadline = time.monotonic() + 30 if deadline is None else deadline
 
     def redirect_request(
         self,
@@ -3722,7 +3928,52 @@ class RestrictedRedirectHandler(urllib.request.HTTPRedirectHandler):
     ) -> Any:
         if not is_allowed_https_url(newurl, self.allowed_hosts):
             raise ConverterError(f"Refused redirect outside the HTTPS source allowlist: {newurl}")
-        return super().redirect_request(request, fp, code, msg, headers, newurl)
+        # Python 3.10 has no 308 adapter. For feed GET/HEAD requests, its 307
+        # adapter has the same method-preserving behavior. Never replay a body.
+        if code == 308 and request.get_method() not in {"GET", "HEAD"}:
+            raise urllib.error.HTTPError(request.full_url, code, msg, headers, fp)
+        delegated_code = 307 if code == 308 else code
+        redirected = super().redirect_request(request, fp, delegated_code, msg, headers, newurl)
+        if code == 308 and redirected is not None:
+            redirected.method = request.get_method()
+        return redirected
+
+    def http_error_302(
+        self, request: urllib.request.Request, fp: Any, code: int, msg: str, headers: Any
+    ) -> Any:
+        try:
+            location = headers.get("Location") or headers.get("URI")
+            if not isinstance(location, str) or not location:
+                raise ConverterError("Feed redirect has no destination")
+            # Header bytes are decoded as Latin-1 by the HTTP client. Preserve
+            # URI punctuation while encoding spaces and non-ASCII bytes.
+            location = urllib.parse.quote(
+                location, safe=":/?#[]@!$&'()*+,;=%", encoding="iso-8859-1"
+            )
+            newurl = urllib.parse.urljoin(request.full_url, location)
+            redirected = self.redirect_request(request, fp, code, msg, headers, newurl)
+            if redirected is None:
+                raise ConverterError("Feed redirect cannot preserve the request method")
+            visited = dict(getattr(request, "redirect_dict", {}))
+            hops = getattr(request, "_feed_redirect_hops", 0)
+            if visited.get(newurl, 0) >= self.max_repeats or hops >= self.max_redirections:
+                raise ConverterError("Feed redirect loop or hop budget exceeded")
+            visited[newurl] = visited.get(newurl, 0) + 1
+            redirected.redirect_dict = visited
+            redirected._feed_redirect_hops = hops + 1
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise ConverterError("Feed download deadline exceeded")
+        finally:
+            # Never drain redirect entities. Inherited HTTPRedirectHandler calls
+            # fp.read() with no size argument before following the redirect.
+            fp.close()
+        return self.parent.open(redirected, timeout=min(request.timeout, remaining))
+
+    http_error_301 = http_error_302
+    http_error_303 = http_error_302
+    http_error_307 = http_error_302
+    http_error_308 = http_error_302
 
 
 def download_feed(source_name: str) -> tuple[bytes, dict[str, Any]]:
@@ -3732,9 +3983,10 @@ def download_feed(source_name: str) -> tuple[bytes, dict[str, Any]]:
     if not is_allowed_https_url(url, allowed_hosts):
         raise ConverterError("Built-in feed URL failed its HTTPS allowlist check")
     context = ssl.create_default_context()
+    deadline = time.monotonic() + 30
     opener = urllib.request.build_opener(
         urllib.request.HTTPSHandler(context=context),
-        RestrictedRedirectHandler(allowed_hosts),
+        RestrictedRedirectHandler(allowed_hosts, deadline=deadline),
     )
     request = urllib.request.Request(
         url,
@@ -3767,7 +4019,11 @@ def download_feed(source_name: str) -> tuple[bytes, dict[str, Any]]:
             chunks: list[bytes] = []
             received = 0
             while True:
+                if time.monotonic() >= deadline:
+                    raise ConverterError("Feed download deadline exceeded")
                 chunk = response.read(min(1024 * 1024, MAX_DOWNLOAD_BYTES - received + 1))
+                if time.monotonic() >= deadline:
+                    raise ConverterError("Feed download deadline exceeded")
                 if not chunk:
                     break
                 received += len(chunk)

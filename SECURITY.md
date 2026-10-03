@@ -109,6 +109,53 @@ unquoted option semicolon is a delimiter, including inside brackets or parenthes
 Quoted content remains intact. Panorama writes no batches or completion manifest
 when any input record fails parsing.
 
+Modern-buffer downgrades to Snort 2 use the same checked buffer/cursor state in
+batch and direct rendering. Decoded Base64, DCE stub, file, packet and raw payload selections
+clear earlier HTTP content modifiers. A removed HTTP selector cannot restore an
+earlier cursor. Relative content requires a preserved cursor in the same buffer;
+a new positive absolute match establishes one, while a negative match does not.
+For this downgrade, buffer selection alone never establishes a match cursor.
+Content modifiers after an intervening selector are refused, including modifiers
+separated from the selector by flow or metadata options. Shared explicit selectors
+also retain their buffer identity when restoring payload after backward HTTP
+modifiers or generated SIP matches. DCE selection resets the cursor to the stub
+buffer start; it cannot inherit an earlier packet match. See the
+[DCE buffer semantics](https://docs.snort.org/rules/options/payload/dce).
+Snort 3 BER cursor operations have no verified Snort 2 mapping and are refused
+in strict, non-strict and direct downgrades. Native Snort 3 use remains supported.
+See the [BER option semantics](https://docs.snort.org/rules/options/payload/ber).
+Relative content modifiers retain the cursor provenance that existed before their
+own content match, including when flow or metadata intervenes. A modifier cannot
+use a cursor created by the same content it modifies. Reverse Snort 2 restoration
+applies the same check and refuses generated buffer switches that lose that cursor.
+Non-content payload operations under a backward-only HTTP buffer are refused.
+Valid consecutive content matches in one buffer remain supported. See the
+[Snort HTTP buffer distinction](https://docs.snort.org/rules/options/payload/http/)
+and [relative content semantics](https://docs.snort.org/rules/options/payload/oddw).
+Direct rendering enforces all known hard compatibility errors. Non-strict unknown
+keywords remain preserved for explicit native-engine review. SIP method/status
+value validation is shared by direct transformation and batch conversion.
+
+SARIF locations percent-encode filenames as URI identities, including spaces,
+reserved characters, Unicode, Windows drive paths and UNC shares. Relative paths
+remain relative, with literal percent signs encoded rather than reinterpreted.
+
+Feed redirects never drain intermediate entities. Every hop must remain on an
+allowlisted HTTPS host, within repeat/hop limits and the shared 30-second request
+deadline. Final-response reads remain byte-bounded and check that same deadline
+before and after each read; a blocking operation is also subject to its socket
+timeout. ZIP helpers preflight the end record and actual central-directory records
+before allocating member objects. Inputs are limited to 64 MiB, directory metadata
+to 8 MiB and entries to 20,000. Counts, offsets and parser readback must agree.
+Single-disk conventional ZIP and fixed-size ZIP64 end records are supported;
+central member disk-start fields must be zero (extended disk-start fields are
+unsupported). Multi-disk/extensible ZIP64, trailing data and malformed metadata
+are refused. Each resolved member offset must identify a complete bounded local
+header. Local/central flags, compression and names must agree, and the standard
+reader's overlap check must pass. Header validation closes each member without
+reading or decompressing its entity.
+Existing extraction size, decoder, path and object-count limits still apply.
+
 File parsing checks the actual opened descriptor against the named file, requires
 a regular bounded stable snapshot, and retains its path and device/inode identity
 for provenance and output protection. Output commands never resolve the original
