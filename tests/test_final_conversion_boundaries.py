@@ -322,18 +322,18 @@ class ConversionBoundaries(unittest.TestCase):
             source = Path(directory) / "input"
             source.write_text(RULE)
             source = source.resolve()
-            original = app.os.open
+            original = app.open_input_descriptor
             raced = []
 
-            def raced_open(path, flags, *args, **kwargs):
+            def raced_open(path):
                 if Path(path) == source:
                     raced.append(True)
                     source.rename(source.with_name("original"))
                     source.write_text(RULE.replace("1001", "9999"))
-                return original(path, flags, *args, **kwargs)
+                return original(path)
 
             with (
-                patch.object(app.os, "open", side_effect=raced_open),
+                patch.object(app, "open_input_descriptor", side_effect=raced_open),
                 self.assertRaisesRegex(app.ConverterError, "identity changed"),
             ):
                 app.RuleParser().parse_file(source)

@@ -165,6 +165,38 @@ directory. Case/Unicode spelling checks are deliberately conservative even on a
 case-sensitive filesystem. Concurrent mutation by the same trusted user is outside
 the output-directory isolation guarantee; detected changes fail closed.
 
+Windows input admission uses GENERIC_READ with FILE_SHARE_READ only and rejects
+reparse/directory/special leaves. Native sharing refuses existing data writers
+and writable mappings and excludes new write/delete opens while the descriptor
+is retained. Attribute-only writes are not excluded by these sharing flags;
+metadata consistency checks remain in place. Every accepted file snapshot also
+retains a SHA-256 of its exact raw bytes, propagated to machine reports and
+generated provenance. POSIX retains descriptor/identity/size/timestamp checks;
+the digest identifies the bytes consumed, but is not a cross-process lock or an
+authenticity proof. Files may change after the read completes.
+
+Library conversion accepts ParseResult and carries immutable complete-parse
+diagnostics on parser-produced ParseResult and Rule objects. A later malformed record rejects
+conversion of the whole batch even through a copied prefix list. Manual detached
+Rule objects require explicit acknowledgement and remain subject to known
+semantic checks. Python callers controlling the objects and private fields are
+trusted application code; this is not isolation against arbitrary Python code.
+Clearing public diagnostics does not remove the retained context. An empty
+sequence is refused because it cannot distinguish a valid empty parse from a
+failed one; a parser-produced empty ParseResult retains that distinction.
+Unmappable service, stream-size, tag and fast-pattern constraints fail closed in
+direct Suricata transformation as well as checked rendering.
+
+Both TAR and ZIP admission reject compressed inputs over 64 MiB before constructing
+the parser. Extraction applies that check before creating an output directory;
+existing decoded-byte, entry, metadata and path limits are independent. Feed
+provenance hashes the complete effective URL without its fragment, retaining
+parameter/query distinctions (including empty delimiters) while redacting those
+fields in display URLs. The digest uses the supplied URL before its first literal
+fragment delimiter, rather than a reconstructed URL. This
+digest binds the request target, not the remote server's identity or content;
+HTTPS allowlists and the separate downloaded-byte digest remain required.
+
 Protected promotion validates bounded distribution contents, then rebuilds wheel
 and sdist containers with exact trusted sibling normalizers at the authenticated
 source epoch. Original producer bytes must equal those canonical bytes, including
