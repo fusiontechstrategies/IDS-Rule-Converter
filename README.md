@@ -255,6 +255,30 @@ read handle excludes data writers, writable mappings and deletion during the
 read. Existing writable handles are refused; close editors that hold one and
 retry. This does not lock the file after parsing or establish who authored it.
 
+File admission retains lexical no-follow directory handles or descriptors and
+opens the leaf relative to that retained parent. User-selected symlinks, junctions,
+parent traversal and writable/untrusted ancestry are refused. Ordinary regular
+local files and Windows short-name spellings remain supported. Windows snapshots
+require a local drive path; UNC and device namespaces are not supported. Only the
+existing root-owned macOS `/var` and `/tmp` aliases receive the documented system
+alias treatment. No existing ownership or permission repair is performed.
+
+Direct rendering and batch conversion share source-dialect admission: `None` and
+`auto` infer the dialect; incompatible legacy buffer ambiguity requires an
+explicit `snort2`, `snort3`, or `suricata` choice. Unknown strings are refused.
+Canonical JSON can describe an ambiguous rule, but does not authorize deploying it.
+Option-only transformation helpers require a concrete source dialect.
+
+Fast-pattern chopping is validated within its associated content group. Both the
+documented pair-only Snort form and a pair with an optional bare `fast_pattern`
+produce exactly one Suricata `fast_pattern:offset,length`. The offset is 0-65535,
+the length is 1-65535, and the nonempty chop must fit the supported content bytes.
+Duplicate markers, orphan pairs, unknown byte escapes and widened-content chops
+are refused. See the primary [Snort fast-pattern guide](https://docs.snort.org/rules/options/payload/fast_pattern)
+and [Suricata prefilter guide](https://docs.suricata.io/en/suricata-8.0.1/rules/prefilter-keywords.html).
+Raw NUL is refused at public text admission and rule/text output boundaries,
+including acknowledged manual rules; quoted hex `|00|` remains ordinary rule syntax.
+
 ## Test evidence
 
 Panorama checks normalize equivalent dotted and legacy buffer selectors before

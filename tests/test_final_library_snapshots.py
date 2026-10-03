@@ -46,6 +46,7 @@ class LibrarySnapshots(unittest.TestCase):
                 ("service", "http"),
                 ("stream_size", ">3,to_server"),
                 ("tag", "session,packets 2"),
+                ("content", '"abcdef"'),
                 ("fast_pattern_offset", "1"),
                 ("fast_pattern_length", "2"),
             )
@@ -57,6 +58,7 @@ class LibrarySnapshots(unittest.TestCase):
                 ("app-layer-protocol", "http"),
                 ("stream_size", "client,>,3"),
                 ("tag", "session,2,packets"),
+                ("content", '"abcdef"'),
                 ("fast_pattern", "1,2"),
             ],
         )

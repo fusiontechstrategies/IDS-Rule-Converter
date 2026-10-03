@@ -317,27 +317,28 @@ class ConversionBoundaries(unittest.TestCase):
             self.assertEqual(result, app.EXIT_FINDINGS)
             self.assertEqual(list(output.iterdir()), [sentinel])
 
-    def test_opened_source_identity_refuses_raced_replacement(self):
+    def test_opened_source_identity_uses_retained_namespace(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "input"
             source.write_text(RULE)
             source = source.resolve()
-            original = app.open_input_descriptor
-            raced = []
+            original = app._open_input_leaf
+            opened = []
 
-            def raced_open(path):
-                if Path(path) == source:
-                    raced.append(True)
-                    source.rename(source.with_name("original"))
-                    source.write_text(RULE.replace("1001", "9999"))
-                return original(path)
+            def retained_open(path, parent):
+                opened.append((path, parent))
+                return original(path, parent)
 
             with (
-                patch.object(app, "open_input_descriptor", side_effect=raced_open),
-                self.assertRaisesRegex(app.ConverterError, "identity changed"),
+                patch.object(app, "_open_input_leaf", side_effect=retained_open),
+                patch.object(
+                    Path, "resolve", side_effect=AssertionError("Unpinned canonicalization")
+                ),
             ):
-                app.RuleParser().parse_file(source)
-            self.assertEqual(raced, [True])
+                parsed = app.RuleParser().parse_file(source)
+            self.assertEqual(parsed.rules[0].sid, 1001)
+            self.assertTrue(opened)
+            self.assertTrue(all(path == source and parent is not None for path, parent in opened))
 
     def test_actual_hardlink_and_case_alias_cannot_replace_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -357,16 +358,15 @@ class ConversionBoundaries(unittest.TestCase):
             self.assertEqual(source.read_text(), RULE)
 
     @unittest.skipIf(os.name == "nt", "POSIX symlink fixture")
-    def test_retargeted_input_alias_cannot_change_provenance_or_guard(self):
+    def test_static_input_alias_refuses_and_regular_input_retains_provenance(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
-            first, second, alias = (root / name for name in ("first", "second", "alias"))
+            first, alias = (root / name for name in ("first", "alias"))
             first.write_text(RULE)
-            second.write_text(RULE.replace("1001", "9999"))
             alias.symlink_to(first)
-            parsed = app.RuleParser().parse_file(alias)
-            alias.unlink()
-            alias.symlink_to(second)
+            with self.assertRaises(app.ConverterError):
+                app.RuleParser().parse_file(alias)
+            parsed = app.RuleParser().parse_file(first)
             self.assertEqual(parsed.source, str(first))
             self.assertEqual(parsed.rules[0].sid, 1001)
             with self.assertRaises(app.ConverterError):
