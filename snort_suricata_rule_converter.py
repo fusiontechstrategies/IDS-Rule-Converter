@@ -479,6 +479,11 @@ class Rule:
     destination_port: str | None
     options: list[RuleOption]
     index: int = 0
+    # Shared immutable diagnostics retain the entire parse, including a rejected suffix,
+    # when callers copy or slice ParseResult.rules. None means unproven manual input.
+    _parse_diagnostics: tuple[Diagnostic, ...] | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     @property
     def headerless(self) -> bool:
@@ -554,6 +559,7 @@ class InputIdentity:
     device: int
     inode: int
     byte_count: int
+    sha256: str | None = None
 
 
 @dataclass
@@ -564,6 +570,10 @@ class ParseResult:
     ignored_directives: int = 0
     byte_count: int = 0
     input_identity: InputIdentity | None = None
+    source_sha256: str | None = None
+    _parse_diagnostics: tuple[Diagnostic, ...] | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     @property
     def errors(self) -> list[Diagnostic]:
@@ -598,6 +608,61 @@ def unquote(value: str) -> str:
     return ("!" if negated else "") + value
 
 
+def open_input_descriptor(path: Path) -> int:
+    """Open a regular leaf without following it; on Windows exclude data writers/deletion."""
+    if sys.platform != "win32":
+        return os.open(
+            path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        )
+    import ctypes.wintypes
+    import msvcrt
+
+    wintypes = ctypes.wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    kernel.GetFileType.argtypes = [wintypes.HANDLE]
+    kernel.GetFileType.restype = wintypes.DWORD
+    kernel.GetFileInformationByHandleEx.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    kernel.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    # GENERIC_READ, FILE_SHARE_READ only, OPEN_EXISTING, OPEN_REPARSE_POINT.
+    # Existing writers/writable mappings are refused, as are new write/delete opens.
+    handle = kernel.CreateFileW(str(path), 0x80000000, 1, None, 3, 0x00200000, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        attributes = (wintypes.DWORD * 2)()
+        if kernel.GetFileType(handle) != 1:
+            raise ConverterError("Input handle is not a disk file")
+        if not kernel.GetFileInformationByHandleEx(
+            handle, 9, attributes, ctypes.sizeof(attributes)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if attributes[0] & (0x10 | 0x400):
+            raise ConverterError("Input leaf is a directory or reparse point")
+        descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+        handle = None  # The CRT descriptor now owns the native handle.
+        return descriptor
+    finally:
+        if handle is not None:
+            kernel.CloseHandle(handle)
+
+
 def read_input(path: Path, max_bytes: int = MAX_INPUT_BYTES) -> tuple[str, InputIdentity]:
     try:
         resolved = path.resolve(strict=True)
@@ -607,9 +672,7 @@ def read_input(path: Path, max_bytes: int = MAX_INPUT_BYTES) -> tuple[str, Input
         expected = resolved.stat()
         if not stat.S_ISREG(expected.st_mode):
             raise ConverterError(f"Input is not a regular file: {resolved}")
-        descriptor = os.open(
-            resolved, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-        )
+        descriptor = open_input_descriptor(resolved)
         with os.fdopen(descriptor, "rb") as stream:
             opened = os.fstat(stream.fileno())
             if not stat.S_ISREG(opened.st_mode):
@@ -644,7 +707,7 @@ def read_input(path: Path, max_bytes: int = MAX_INPUT_BYTES) -> tuple[str, Input
         raise ConverterError(f"Input contains NUL bytes and is not a text ruleset: {resolved}")
     try:
         return data.decode("utf-8-sig"), InputIdentity(
-            resolved, opened.st_dev, opened.st_ino, len(data)
+            resolved, opened.st_dev, opened.st_ino, len(data), hashlib.sha256(data).hexdigest()
         )
     except UnicodeDecodeError as exc:
         raise ConverterError(
@@ -1493,6 +1556,7 @@ class RuleParser:
         text, identity = read_input(path)
         result = self.parse_text(text, str(identity.path), byte_count=identity.byte_count)
         result.input_identity = identity
+        result.source_sha256 = identity.sha256
         return result
 
     def parse_text(
@@ -1503,7 +1567,11 @@ class RuleParser:
         size = len(text.encode("utf-8")) if byte_count is None else byte_count
         if size > MAX_INPUT_BYTES:
             raise ConverterError("Input exceeds its byte budget")
-        result = ParseResult(source=source, byte_count=size)
+        result = ParseResult(
+            source=source,
+            byte_count=size,
+            source_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        )
         try:
             cleaned = strip_rule_comments(text)
         except UnterminatedBlockComment as exc:
@@ -1512,6 +1580,7 @@ class RuleParser:
                     "error", "UNTERMINATED_BLOCK_COMMENT", str(exc), source, exc.line, exc.line
                 )
             )
+            result._parse_diagnostics = tuple(result.diagnostics)
             return result
         total_options = 0
         for record_index, (raw, start_line, end_line) in enumerate(
@@ -1530,6 +1599,10 @@ class RuleParser:
                         "Parser total option budget exceeded; no partial output is safe"
                     )
                 result.rules.append(rule)
+        parse_diagnostics = tuple(result.diagnostics)
+        result._parse_diagnostics = parse_diagnostics
+        for rule in result.rules:
+            rule._parse_diagnostics = parse_diagnostics
         return result
 
     def _records(self, text: str, result: ParseResult) -> Iterator[tuple[str, int, int]]:
@@ -2383,8 +2456,10 @@ def transform_to_suricata(
     while index < len(options):
         option = options[index]
         key = option.key
-        if key == "service" and option.value is not None:
-            service = mapped_suricata_service(option.value)
+        if key == "service":
+            service = mapped_suricata_service(option.value) if option.value is not None else None
+            if service is None:
+                raise ConverterError("service has no proven single-protocol Suricata mapping")
             if (
                 service is not None
                 and service not in implied_protocols
@@ -2399,24 +2474,24 @@ def transform_to_suricata(
             if value is None:
                 raise ConverterError("bufferlen cannot safely map to Suricata bsize")
             transformed.append(RuleOption("bsize", value, option.raw, option.origin))
-        elif key == "tag" and option.value is not None:
-            value = mapped_suricata_tag(option.value)
-            if value is not None:
-                transformed.append(RuleOption("tag", value, option.raw, option.origin))
-        elif (
-            key == "stream_size"
-            and option.value is not None
-            and source_dialect in {"snort2", "snort3"}
-        ):
-            value = mapped_suricata_stream_size(option.value)
-            if value is not None:
-                transformed.append(RuleOption("stream_size", value, option.raw, option.origin))
+        elif key == "tag":
+            value = mapped_suricata_tag(option.value) if option.value is not None else None
+            if value is None:
+                raise ConverterError("tag cannot safely map to Suricata")
+            transformed.append(RuleOption("tag", value, option.raw, option.origin))
+        elif key == "stream_size" and source_dialect in {"snort2", "snort3"}:
+            value = mapped_suricata_stream_size(option.value) if option.value is not None else None
+            if value is None:
+                raise ConverterError("stream_size cannot safely map to Suricata")
+            transformed.append(RuleOption("stream_size", value, option.raw, option.origin))
         elif key == "fast_pattern_offset":
             if (
                 option.value is not None
+                and re.fullmatch(r"[0-9]+", option.value.strip()) is not None
                 and index + 1 < len(options)
                 and options[index + 1].key == "fast_pattern_length"
                 and options[index + 1].value is not None
+                and re.fullmatch(r"[0-9]+", options[index + 1].value.strip()) is not None
             ):
                 transformed.append(
                     RuleOption(
@@ -2426,8 +2501,12 @@ def transform_to_suricata(
                     )
                 )
                 index += 1
+            else:
+                raise ConverterError(
+                    "fast_pattern_offset requires adjacent numeric fast_pattern_length"
+                )
         elif key == "fast_pattern_length":
-            pass
+            raise ConverterError("fast_pattern_length has no preceding fast_pattern_offset")
         elif key in SNORT_TO_SURICATA_OPTION:
             value = mapped_suricata_sip_value(option)
             if value is None:
@@ -2909,13 +2988,69 @@ def compatibility_diagnostics(
 
 
 def convert_rules(
-    rules: Sequence[Rule],
+    rules: ParseResult | Sequence[Rule],
     target: str,
     strict: bool = True,
     source_dialect: str = "auto",
+    *,
+    allow_detached_rules: bool = False,
 ) -> ConversionResult:
+    """Convert a complete parse. Manual Rule objects require explicit provenance acknowledgement.
+
+    That acknowledgement never overrides errors retained from a real parse. It
+    does not relax dialect or semantic compatibility checks.
+    """
     result = ConversionResult(target=target)
-    for rule in rules:
+    parsed = rules if isinstance(rules, ParseResult) else None
+    source_rules = parsed.rules if parsed is not None else rules
+    if len(source_rules) > MAX_PARSED_RULES:
+        raise ConverterError("Conversion rule count budget exceeded")
+    seen_contexts: set[int] = set()
+    contexts: list[Sequence[Diagnostic]] = [parsed.diagnostics] if parsed is not None else []
+    if parsed is not None and parsed._parse_diagnostics is not None:
+        seen_contexts.add(id(parsed._parse_diagnostics))
+        contexts.append(parsed._parse_diagnostics)
+    if not source_rules and (parsed is None or parsed._parse_diagnostics is None):
+        extend_diagnostics(
+            result.diagnostics,
+            [
+                Diagnostic(
+                    "error",
+                    "DETACHED_RULE_PROVENANCE",
+                    "An empty rule sequence has no complete-parse provenance; pass the parser-produced ParseResult",
+                    parsed.source if parsed is not None else "<input>",
+                )
+            ],
+        )
+    unproven = []
+    for rule in source_rules:
+        origin = rule._parse_diagnostics
+        if origin is None:
+            unproven.append(rule)
+        elif id(origin) not in seen_contexts:
+            seen_contexts.add(id(origin))
+            contexts.append(origin)
+    seen_diagnostics: set[Diagnostic] = set()
+    for context in contexts:
+        # ParseResult and its immutable Rule context usually describe the same
+        # diagnostics. Deduplicate before counting, preserving every unique one.
+        for diagnostic in context:
+            if diagnostic not in seen_diagnostics:
+                extend_diagnostics(result.diagnostics, [diagnostic])
+                seen_diagnostics.add(diagnostic)
+    if unproven:
+        result.diagnostics.append(
+            Diagnostic(
+                "warning" if allow_detached_rules else "error",
+                "DETACHED_RULE_PROVENANCE",
+                "Manual Rule objects have no complete-parse provenance; pass ParseResult or explicitly acknowledge allow_detached_rules=True",
+                unproven[0].source,
+            )
+        )
+    if result.errors:
+        result.rejected_rule_indexes = [rule.index for rule in source_rules]
+        return result
+    for rule in source_rules:
         if len(result.diagnostics) >= MAX_DIAGNOSTICS:
             raise ConverterError("Diagnostic budget exceeded; no partial output is safe")
         dialect = infer_dialect(rule) if source_dialect == "auto" else source_dialect
@@ -2955,7 +3090,7 @@ def convert_rules(
                 "UNVERIFIED_KEYWORDS_PRESERVED",
                 "Some target keywords were preserved exactly but require validation in the target engine: "
                 + ", ".join(sorted(result.unverified_keywords)),
-                rules[0].source if rules else "<input>",
+                source_rules[0].source if source_rules else "<input>",
             )
         )
     return result
@@ -3044,6 +3179,7 @@ def ruleset_analysis(parsed: ParseResult) -> dict[str, Any]:
         "tool": {"name": APP_NAME, "version": VERSION},
         "source": parsed.source,
         "bytes": parsed.byte_count,
+        "source_sha256": parsed.source_sha256,
         "rule_count": len(parsed.rules),
         "ignored_directive_lines": parsed.ignored_directives,
         "diagnostic_counts": diagnostic_counts(parsed.diagnostics),
@@ -3116,6 +3252,17 @@ def sarif_report(parsed: ParseResult, extra: Sequence[Diagnostic] = ()) -> dict[
                     }
                 },
                 "results": results,
+                "artifacts": [
+                    {
+                        "location": {"uri": sarif_artifact_uri(parsed.source)},
+                        "length": parsed.byte_count,
+                        **(
+                            {"hashes": {"sha-256": parsed.source_sha256}}
+                            if parsed.source_sha256
+                            else {}
+                        ),
+                    }
+                ],
             }
         ],
     }
@@ -3573,6 +3720,7 @@ def build_panorama_report(
         "profile": f"Panorama IPS Signature Converter Plugin {PANORAMA_PROFILE}",
         "source": parsed.source,
         "source_bytes": parsed.byte_count,
+        "source_sha256": parsed.source_sha256,
         "source_exceeds_plugin_upload_limit": parsed.byte_count > PANORAMA_MAX_UPLOAD_BYTES,
         "parsed_rules": len(parsed.rules),
         "accepted_rules": len(accepted),
@@ -3600,6 +3748,7 @@ def report_as_text(report: Mapping[str, Any]) -> str:
         f"Profile: {report['profile']}",
         f"Source: {report['source']}",
         f"Source bytes: {report['source_bytes']:,}",
+        f"Source SHA-256: {report.get('source_sha256') or 'unavailable'}",
         f"Parsed rules: {report['parsed_rules']:,}",
         f"Accepted rules: {report['accepted_rules']:,}",
         f"Rejected rules: {report['rejected_rules']:,}",
@@ -3679,6 +3828,8 @@ def ruleset_diff(before: ParseResult, after: ParseResult) -> dict[str, Any]:
         "tool": {"name": APP_NAME, "version": VERSION},
         "before": before.source,
         "after": after.source,
+        "before_sha256": before.source_sha256,
+        "after_sha256": after.source_sha256,
         "summary": {
             "added": len(added),
             "removed": len(removed),
@@ -3770,7 +3921,13 @@ def check_archive_object_budget(names: Iterable[str]) -> None:
                 raise ConverterError("Archive exceeds its total filesystem object budget")
 
 
+def preflight_archive_input(data: bytes) -> None:
+    if len(data) > MAX_DOWNLOAD_BYTES:
+        raise ConverterError("Archive input exceeds the download byte limit")
+
+
 def validate_tar_archive(data: bytes) -> list[tarfile.TarInfo]:
+    preflight_archive_input(data)
     if not data.startswith(b"\x1f\x8b"):
         raise ConverterError("Expected a gzip-compressed TAR archive")
     members = []
@@ -3813,8 +3970,7 @@ def validate_tar_archive(data: bytes) -> list[tarfile.TarInfo]:
 
 def preflight_zip_directory(data: bytes) -> tuple[int, int]:
     """Bound and count directory records before ZipFile allocates any ZipInfo."""
-    if len(data) > MAX_DOWNLOAD_BYTES:
-        raise ConverterError("ZIP input exceeds the download byte limit")
+    preflight_archive_input(data)
     end = data.rfind(b"PK\x05\x06", max(0, len(data) - 65557))
     if end < 0 or end + 22 > len(data):
         raise ConverterError("ZIP has no complete end-of-directory record")
@@ -3952,6 +4108,7 @@ def validate_zip_archive(data: bytes) -> list[zipfile.ZipInfo]:
 
 
 def extract_archive(data: bytes, archive_type: str, output_dir: Path, force: bool) -> list[Path]:
+    preflight_archive_input(data)
     if output_dir.is_symlink() or (
         output_dir.exists()
         and getattr(output_dir.lstat(), "st_file_attributes", 0)
@@ -4095,6 +4252,20 @@ class RestrictedRedirectHandler(urllib.request.HTTPRedirectHandler):
     http_error_308 = http_error_302
 
 
+def feed_url_provenance(url: str) -> tuple[str, str]:
+    """Redact parameters/query while hashing the complete effective target, without fragment."""
+    parsed = urllib.parse.urlparse(url)
+    # URL reconstruction drops empty '?' and ';' delimiters that urllib sends
+    # as distinct request selectors. Hash the supplied target bytes instead.
+    effective = url.partition("#")[0]
+    display = parsed._replace(
+        params="[redacted]" if parsed.params else "",
+        query="[redacted]" if parsed.query else "",
+        fragment="",
+    ).geturl()
+    return display, hashlib.sha256(effective.encode("utf-8")).hexdigest()
+
+
 def download_feed(source_name: str) -> tuple[bytes, dict[str, Any]]:
     source = FEEDS[source_name]
     url = str(source["url"])
@@ -4119,10 +4290,7 @@ def download_feed(source_name: str) -> tuple[bytes, dict[str, Any]]:
         with opener.open(request, timeout=30) as response:
             final_url = response.geturl()
             if not is_allowed_https_url(final_url, allowed_hosts):
-                raise ConverterError(
-                    f"Download ended outside the HTTPS source allowlist: {final_url}"
-                )
-            final = urllib.parse.urlparse(final_url)
+                raise ConverterError("Download ended outside the HTTPS source allowlist")
             length_header = response.headers.get("Content-Length")
             if length_header:
                 try:
@@ -4156,13 +4324,15 @@ def download_feed(source_name: str) -> tuple[bytes, dict[str, Any]]:
     data = b"".join(chunks)
     if not data:
         raise ConverterError("Feed download returned an empty file")
+    source_display, source_digest = feed_url_provenance(url)
+    resolved_display, resolved_digest = feed_url_provenance(final_url)
     metadata = {
         "source": source_name,
         "description": source["description"],
-        "source_url": url,
-        "resolved_url": urllib.parse.urlunparse(
-            (final.scheme, final.netloc, final.path, "", "", "")
-        ),
+        "source_url": source_display,
+        "source_url_sha256": source_digest,
+        "resolved_url": resolved_display,
+        "resolved_url_sha256": resolved_digest,
         "downloaded_at": utc_now(),
         "bytes": len(data),
         "sha256": hashlib.sha256(data).hexdigest(),
@@ -4202,6 +4372,8 @@ def command_validate(args: argparse.Namespace) -> int:
             "generated_at": utc_now(),
             "tool": {"name": APP_NAME, "version": VERSION},
             "source": parsed.source,
+            "source_sha256": parsed.source_sha256,
+            "source_bytes": parsed.byte_count,
             "rule_count": len(parsed.rules),
             "diagnostic_counts": diagnostic_counts(parsed.diagnostics),
             "diagnostics": [item.to_dict() for item in parsed.diagnostics],
@@ -4279,6 +4451,8 @@ def command_convert(args: argparse.Namespace) -> int:
             "generated_at": utc_now(),
             "tool": {"name": APP_NAME, "version": VERSION},
             "source": parsed.source,
+            "source_sha256": parsed.source_sha256,
+            "source_bytes": parsed.byte_count,
             "rules": [rule_to_dict(rule) for rule in parsed.rules],
             "diagnostics": [item.to_dict() for item in parsed.diagnostics],
         }
@@ -4291,16 +4465,17 @@ def command_convert(args: argparse.Namespace) -> int:
         print(f"Exported {len(parsed.rules):,} rules to {terminal_safe(args.output)}")
         return EXIT_OK
     converted = convert_rules(
-        parsed.rules,
+        parsed,
         args.target,
         strict=not args.allow_unverified,
         source_dialect=args.source_dialect,
     )
-    all_diagnostics = list(parsed.diagnostics)
-    extend_diagnostics(all_diagnostics, converted.diagnostics)
+    all_diagnostics = list(converted.diagnostics)
     output_lines = [
         f"# Generated by {APP_NAME} {VERSION}",
         f"# Source: {json.dumps(Path(parsed.source).name, ensure_ascii=True)}",
+        f"# Source SHA-256: {parsed.source_sha256}",
+        f"# Source bytes: {parsed.byte_count}",
         f"# Target dialect: {args.target}",
         f"# Rejected input rules: {len(converted.rejected_rule_indexes)}",
         "# Validate this ruleset with the target engine before deployment.",
@@ -4349,6 +4524,8 @@ def command_convert(args: argparse.Namespace) -> int:
             "generated_at": utc_now(),
             "tool": {"name": APP_NAME, "version": VERSION},
             "source": parsed.source,
+            "source_sha256": parsed.source_sha256,
+            "source_bytes": parsed.byte_count,
             "target": args.target,
             "source_dialect": args.source_dialect,
             "allow_unverified": args.allow_unverified,
@@ -4416,6 +4593,8 @@ def command_panorama(args: argparse.Namespace) -> int:
     manifest_path = output_dir / "panorama_manifest.json"
     manifest = {
         "generation_id": uuid.uuid4().hex,
+        "source_sha256": parsed.source_sha256,
+        "source_bytes": parsed.byte_count,
         "sha256": {
             path.name: hashlib.sha256(content.encode("utf-8")).hexdigest()
             for path, content in files

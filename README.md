@@ -212,6 +212,44 @@ The downloaded archive, SHA-256 metadata, and extracted files are local outputs.
 Rules remain subject to their provider's terms and are not part of this project's
 Apache 2.0 license.
 
+Feed metadata records a SHA-256 digest of both the configured URL and the complete
+effective redirect target, including parameters and query order, without the
+fragment (which is not sent to the server). Display URLs redact parameters and
+queries so authentication tokens do not enter the metadata. Compare the digests
+when checking whether two downloads used the same target.
+
+## Python library use and input provenance
+
+Pass the entire parse result when converting a ruleset:
+
+```python
+from pathlib import Path
+from snort_suricata_rule_converter import RuleParser, convert_rules
+
+parsed = RuleParser().parse_file(Path("input.rules"))
+converted = convert_rules(parsed, "suricata", source_dialect="snort3")
+if converted.errors:
+    raise ValueError("Review the diagnostics before using any converted rules")
+```
+
+Any parse error rejects the complete conversion, including a valid prefix before
+an invalid later record. Parser-produced rules retain their complete parse
+diagnostics when their nonempty list is copied or sliced. The `ParseResult`
+also retains diagnostics when a failed parse produces no rules. Empty sequences
+have no parse provenance and are refused; use the complete parser-produced
+`ParseResult` for a valid empty input. Manually constructed `Rule`
+objects require `allow_detached_rules=True` and produce a provenance warning.
+That option acknowledges the caller's responsibility for the original input; it
+never overrides a known parse failure or unsafe semantic mapping. Direct option
+transformers also refuse constraints they cannot preserve.
+
+File input snapshots record the SHA-256 of the exact consumed bytes, including a
+UTF-8 BOM and original line endings. JSON, SARIF, conversion comments, Panorama
+reports/manifests and diff reports retain that digest. On Windows, a retained
+read handle excludes data writers, writable mappings and deletion during the
+read. Existing writable handles are refused; close editors that hold one and
+retry. This does not lock the file after parsing or establish who authored it.
+
 ## Test evidence
 
 The 4.0.1 release-readiness tree contains 64 automated tests covering parsing,
