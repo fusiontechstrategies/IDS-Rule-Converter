@@ -239,6 +239,11 @@ also retains diagnostics when a failed parse produces no rules. Empty sequences
 have no parse provenance and are refused; use the complete parser-produced
 `ParseResult` for a valid empty input. Manually constructed `Rule`
 objects require `allow_detached_rules=True` and produce a provenance warning.
+The same acknowledgement is required when calling `render_rule` or
+`rule_to_dict` directly with a manual `Rule`. Direct rendering, per-rule JSON,
+batch conversion and Panorama admission all refuse errors retained from the
+complete parse, even if public diagnostics were cleared. An acknowledgement
+never overrides a known parse failure or a target compatibility error.
 That option acknowledges the caller's responsibility for the original input; it
 never overrides a known parse failure or unsafe semantic mapping. Direct option
 transformers also refuse constraints they cannot preserve.
@@ -251,6 +256,11 @@ read. Existing writable handles are refused; close editors that hold one and
 retry. This does not lock the file after parsing or establish who authored it.
 
 ## Test evidence
+
+Panorama checks normalize equivalent dotted and legacy buffer selectors before
+applying compatibility policy. Raw HTTP header, host and URI selectors are
+rejected under either spelling. Supported normalized HTTP buffers remain
+available; native Panorama validation is still required before deployment.
 
 The 4.0.1 release-readiness tree contains 64 automated tests covering parsing,
 conversion, reports, Panorama checks, overwrite controls, URL and redirect

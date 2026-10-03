@@ -447,6 +447,19 @@ class Diagnostic:
 
 
 @dataclass(frozen=True)
+class _ParseContext:
+    """Immutable evidence and admission summary created once for a complete parse."""
+
+    diagnostics: tuple[Diagnostic, ...]
+    has_errors: bool = field(init=False)
+    unique_diagnostic_count: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "has_errors", any(d.severity == "error" for d in self.diagnostics))
+        object.__setattr__(self, "unique_diagnostic_count", len(set(self.diagnostics)))
+
+
+@dataclass(frozen=True)
 class RuleOption:
     name: str
     value: str | None
@@ -479,11 +492,15 @@ class Rule:
     destination_port: str | None
     options: list[RuleOption]
     index: int = 0
-    # Shared immutable diagnostics retain the entire parse, including a rejected suffix,
+    # Shared immutable context retains the entire parse, including a rejected suffix,
     # when callers copy or slice ParseResult.rules. None means unproven manual input.
-    _parse_diagnostics: tuple[Diagnostic, ...] | None = field(
+    _parse_context: _ParseContext | None = field(
         default=None, init=False, repr=False, compare=False
     )
+
+    @property
+    def _parse_diagnostics(self) -> tuple[Diagnostic, ...] | None:
+        return self._parse_context.diagnostics if self._parse_context is not None else None
 
     @property
     def headerless(self) -> bool:
@@ -571,9 +588,13 @@ class ParseResult:
     byte_count: int = 0
     input_identity: InputIdentity | None = None
     source_sha256: str | None = None
-    _parse_diagnostics: tuple[Diagnostic, ...] | None = field(
+    _parse_context: _ParseContext | None = field(
         default=None, init=False, repr=False, compare=False
     )
+
+    @property
+    def _parse_diagnostics(self) -> tuple[Diagnostic, ...] | None:
+        return self._parse_context.diagnostics if self._parse_context is not None else None
 
     @property
     def errors(self) -> list[Diagnostic]:
@@ -1580,7 +1601,7 @@ class RuleParser:
                     "error", "UNTERMINATED_BLOCK_COMMENT", str(exc), source, exc.line, exc.line
                 )
             )
-            result._parse_diagnostics = tuple(result.diagnostics)
+            result._parse_context = _ParseContext(tuple(result.diagnostics))
             return result
         total_options = 0
         for record_index, (raw, start_line, end_line) in enumerate(
@@ -1599,10 +1620,10 @@ class RuleParser:
                         "Parser total option budget exceeded; no partial output is safe"
                     )
                 result.rules.append(rule)
-        parse_diagnostics = tuple(result.diagnostics)
-        result._parse_diagnostics = parse_diagnostics
+        parse_context = _ParseContext(tuple(result.diagnostics))
+        result._parse_context = parse_context
         for rule in result.rules:
-            rule._parse_diagnostics = parse_diagnostics
+            rule._parse_context = parse_context
         return result
 
     def _records(self, text: str, result: ParseResult) -> Iterator[tuple[str, int, int]]:
@@ -2559,7 +2580,89 @@ def transform_to_snort3(options: Sequence[RuleOption], source_dialect: str) -> l
     return transformed
 
 
-def render_rule(rule: Rule, target: str, source_dialect: str | None = None) -> str:
+def complete_parse_diagnostics(
+    source_rules: Sequence[Rule],
+    parsed: ParseResult | None = None,
+    *,
+    allow_detached_rules: bool = False,
+) -> list[Diagnostic]:
+    """Collect bounded whole-parse evidence for every deployable output path."""
+    if len(source_rules) > MAX_PARSED_RULES:
+        raise ConverterError("Conversion rule count budget exceeded")
+    diagnostics: list[Diagnostic] = []
+    seen_contexts: set[int] = set()
+    contexts: list[Sequence[Diagnostic]] = [parsed.diagnostics] if parsed is not None else []
+    if parsed is not None and parsed._parse_diagnostics is not None:
+        seen_contexts.add(id(parsed._parse_diagnostics))
+        contexts.append(parsed._parse_diagnostics)
+    if not source_rules and (parsed is None or parsed._parse_diagnostics is None):
+        extend_diagnostics(
+            diagnostics,
+            [
+                Diagnostic(
+                    "error",
+                    "DETACHED_RULE_PROVENANCE",
+                    "An empty rule sequence has no complete-parse provenance; pass the parser-produced ParseResult",
+                    parsed.source if parsed is not None else "<input>",
+                )
+            ],
+        )
+    unproven: list[Rule] = []
+    for rule in source_rules:
+        origin = rule._parse_diagnostics
+        if origin is None:
+            unproven.append(rule)
+        elif id(origin) not in seen_contexts:
+            seen_contexts.add(id(origin))
+            contexts.append(origin)
+    seen_diagnostics: set[Diagnostic] = set()
+    for context in contexts:
+        # ParseResult and its immutable Rule context usually describe the same
+        # diagnostics. Deduplicate before counting, preserving every unique one.
+        for diagnostic in context:
+            if diagnostic not in seen_diagnostics:
+                extend_diagnostics(diagnostics, [diagnostic])
+                seen_diagnostics.add(diagnostic)
+    if unproven:
+        extend_diagnostics(
+            diagnostics,
+            [
+                Diagnostic(
+                    "warning" if allow_detached_rules else "error",
+                    "DETACHED_RULE_PROVENANCE",
+                    "Manual Rule objects have no complete-parse provenance; pass ParseResult or explicitly acknowledge allow_detached_rules=True",
+                    unproven[0].source,
+                )
+            ],
+        )
+    return diagnostics
+
+
+def render_rule(
+    rule: Rule,
+    target: str,
+    source_dialect: str | None = None,
+    *,
+    allow_detached_rules: bool = False,
+) -> str:
+    if MAX_PARSED_RULES < 1:
+        raise ConverterError("Conversion rule count budget exceeded")
+    # The parser computes this summary once over the immutable complete context.
+    # Public per-rule and JSON calls must not rescan it for every rule in a batch.
+    context = rule._parse_context
+    if context is None:
+        if MAX_DIAGNOSTICS < 1:
+            raise ConverterError("Diagnostic budget exceeded; no partial output is safe")
+        if not allow_detached_rules:
+            raise ConverterError(
+                "Complete parse provenance is required; no partial rule output is safe"
+            )
+    elif context.unique_diagnostic_count > MAX_DIAGNOSTICS:
+        raise ConverterError("Diagnostic budget exceeded; no partial output is safe")
+    elif context.has_errors:
+        raise ConverterError(
+            "Complete parse provenance is required; no partial rule output is safe"
+        )
     dialect = source_dialect or infer_dialect(rule)
     if dialect == "ambiguous":
         if target == "ambiguous":
@@ -3005,48 +3108,10 @@ def convert_rules(
     source_rules = parsed.rules if parsed is not None else rules
     if len(source_rules) > MAX_PARSED_RULES:
         raise ConverterError("Conversion rule count budget exceeded")
-    seen_contexts: set[int] = set()
-    contexts: list[Sequence[Diagnostic]] = [parsed.diagnostics] if parsed is not None else []
-    if parsed is not None and parsed._parse_diagnostics is not None:
-        seen_contexts.add(id(parsed._parse_diagnostics))
-        contexts.append(parsed._parse_diagnostics)
-    if not source_rules and (parsed is None or parsed._parse_diagnostics is None):
-        extend_diagnostics(
-            result.diagnostics,
-            [
-                Diagnostic(
-                    "error",
-                    "DETACHED_RULE_PROVENANCE",
-                    "An empty rule sequence has no complete-parse provenance; pass the parser-produced ParseResult",
-                    parsed.source if parsed is not None else "<input>",
-                )
-            ],
-        )
-    unproven = []
-    for rule in source_rules:
-        origin = rule._parse_diagnostics
-        if origin is None:
-            unproven.append(rule)
-        elif id(origin) not in seen_contexts:
-            seen_contexts.add(id(origin))
-            contexts.append(origin)
-    seen_diagnostics: set[Diagnostic] = set()
-    for context in contexts:
-        # ParseResult and its immutable Rule context usually describe the same
-        # diagnostics. Deduplicate before counting, preserving every unique one.
-        for diagnostic in context:
-            if diagnostic not in seen_diagnostics:
-                extend_diagnostics(result.diagnostics, [diagnostic])
-                seen_diagnostics.add(diagnostic)
-    if unproven:
-        result.diagnostics.append(
-            Diagnostic(
-                "warning" if allow_detached_rules else "error",
-                "DETACHED_RULE_PROVENANCE",
-                "Manual Rule objects have no complete-parse provenance; pass ParseResult or explicitly acknowledge allow_detached_rules=True",
-                unproven[0].source,
-            )
-        )
+    extend_diagnostics(
+        result.diagnostics,
+        complete_parse_diagnostics(source_rules, parsed, allow_detached_rules=allow_detached_rules),
+    )
     if result.errors:
         result.rejected_rule_indexes = [rule.index for rule in source_rules]
         return result
@@ -3072,7 +3137,7 @@ def convert_rules(
             result.rejected_rule_indexes.append(rule.index)
             continue
         try:
-            rendered = render_rule(rule, target, dialect)
+            rendered = render_rule(rule, target, dialect, allow_detached_rules=allow_detached_rules)
         except ConverterError as error:
             extend_diagnostics(
                 result.diagnostics,
@@ -3096,8 +3161,9 @@ def convert_rules(
     return result
 
 
-def rule_to_dict(rule: Rule) -> dict[str, Any]:
+def rule_to_dict(rule: Rule, *, allow_detached_rules: bool = False) -> dict[str, Any]:
     dialect = infer_dialect(rule)
+    canonical_rule = render_rule(rule, dialect, dialect, allow_detached_rules=allow_detached_rules)
     return {
         "index": rule.index,
         "source": rule.source,
@@ -3119,7 +3185,7 @@ def rule_to_dict(rule: Rule) -> dict[str, Any]:
         "message": rule.message,
         "fingerprint": semantic_fingerprint(rule),
         "options": [asdict(option) for option in rule.options],
-        "canonical_rule": render_rule(rule, dialect, dialect),
+        "canonical_rule": canonical_rule,
     }
 
 
@@ -3443,7 +3509,8 @@ def panorama_option_checks(rule: Rule) -> list[Diagnostic]:
         "rawbytes",
     }
     for index, option in enumerate(rule.options):
-        key = option.key
+        # Equivalent legacy and dotted selectors must receive one policy decision.
+        key = DOTTED_TO_LEGACY_BUFFER.get(option.key, option.key)
         if key in PANORAMA_IGNORED_DETECTION_OPTIONS:
             diagnostics.append(
                 option_diagnostic(
@@ -3692,11 +3759,21 @@ def build_panorama_report(
 ) -> tuple[dict[str, Any], list[Rule], list[Rule], list[Diagnostic]]:
     accepted: list[Rule] = []
     rejected: list[Rule] = []
-    diagnostics = list(parsed.diagnostics)
+    diagnostics = complete_parse_diagnostics(parsed.rules, parsed)
+    incomplete_parse = any(item.severity == "error" for item in diagnostics)
     per_rule: list[dict[str, Any]] = []
-    parse_error_lines = {item.start_line for item in parsed.errors}
+    parse_error_lines = {item.start_line for item in diagnostics if item.severity == "error"}
     for rule in parsed.rules:
         findings = panorama_option_checks(rule)
+        if incomplete_parse:
+            findings.append(
+                option_diagnostic(
+                    rule,
+                    "error",
+                    "INCOMPLETE_PARSE",
+                    "The complete parse has a failure; no prefix belongs in an accepted batch",
+                )
+            )
         extend_diagnostics(diagnostics, findings)
         errors = [item for item in findings if item.severity == "error"]
         if errors:

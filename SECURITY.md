@@ -202,3 +202,19 @@ and sdist containers with exact trusted sibling normalizers at the authenticated
 source epoch. Original producer bytes must equal those canonical bytes, including
 archive ordering, timestamps, modes, owners, comments, PAX data and gzip framing.
 Recomputing producer checksums or evidence cannot authorize noncanonical metadata.
+
+Deployable library output shares one bounded complete-parse admission check.
+Direct rendering, per-rule canonical JSON and Panorama admission retain errors
+from the whole parse, including after public diagnostics are cleared. Manual
+detached Rule objects require explicit acknowledgement for rendering/JSON,
+matching batch conversion; that flag cannot waive a known parse failure or a
+target compatibility error. Trusted Python code can still change private fields.
+The parser binds an immutable error/count summary to that exact diagnostic tuple
+once. Public per-rule rendering and JSON consult that summary in constant time;
+collection admission visits each retained context once. Diagnostic work therefore
+does not multiply the rule count by the shared parse's diagnostic count.
+
+Panorama policy canonicalizes dotted and legacy buffer names before deciding
+whether a selector is supported. Raw HTTP header, host and URI selectors are
+rejected under either spelling. This is an offline compatibility model; native
+appliance validation remains a separate operator requirement.
