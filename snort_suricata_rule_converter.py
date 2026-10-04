@@ -5739,27 +5739,29 @@ def _archive_generation(output_dir: Path, graph):
                 primary = initiating[0] if initiating else caught
                 if caught is not primary:
                     _retain_archive_cleanup_failure(primary, caught)
-                if not committed and identity is not None:
-                    try:
-                        _cleanup_archive_generation(
-                            parent,
-                            staging_name,
-                            identity,
-                            journal or _ArchiveCreationJournal(staging_path, None, api),
-                            api,
-                        )
-                    except (OSError, ConverterError) as cleanup:
-                        _retain_archive_cleanup_failure(primary, cleanup)
-                elif not committed and stage_created:
-                    _retain_archive_cleanup_failure(
-                        primary,
-                        ConverterError(
-                            "Created stage identity is unavailable; owner review required"
-                        ),
-                    )
                 if caught is primary:
                     raise
                 raise primary from primary.__cause__
+            finally:
+                if not committed and primary is not None:
+                    if identity is not None:
+                        try:
+                            _cleanup_archive_generation(
+                                parent,
+                                staging_name,
+                                identity,
+                                journal or _ArchiveCreationJournal(staging_path, None, api),
+                                api,
+                            )
+                        except (OSError, ConverterError) as cleanup:
+                            _retain_archive_cleanup_failure(primary, cleanup)
+                    elif stage_created:
+                        _retain_archive_cleanup_failure(
+                            primary,
+                            ConverterError(
+                                "Created stage identity is unavailable; owner review required"
+                            ),
+                        )
     except BaseException as caught:
         if primary is not None and caught is not primary:
             _retain_archive_cleanup_failure(primary, caught)
@@ -5821,25 +5823,31 @@ def _fetch_extraction_root(output_dir: Path, name: str):
                 primary = initiating[0] if initiating else caught
                 if caught is not primary:
                     _retain_archive_cleanup_failure(primary, caught)
-                if not committed and identity is not None:
-                    try:
-                        # An empty journal authorizes no child removal: a residual,
-                        # substituted or unowned object makes empty-root removal refuse.
-                        _cleanup_archive_generation(
-                            parent, name, identity, _ArchiveCreationJournal(root, None, api), api
-                        )
-                    except (OSError, ConverterError) as cleanup:
-                        _retain_archive_cleanup_failure(primary, cleanup)
-                elif not committed and created:
-                    _retain_archive_cleanup_failure(
-                        primary,
-                        ConverterError(
-                            "Created fetch root identity unavailable; owner review required"
-                        ),
-                    )
                 if caught is primary:
                     raise
                 raise primary from primary.__cause__
+            finally:
+                if not committed and primary is not None:
+                    if identity is not None:
+                        try:
+                            # An empty journal authorizes no child removal: a residual,
+                            # substituted or unowned object makes empty-root removal refuse.
+                            _cleanup_archive_generation(
+                                parent,
+                                name,
+                                identity,
+                                _ArchiveCreationJournal(root, None, api),
+                                api,
+                            )
+                        except (OSError, ConverterError) as cleanup:
+                            _retain_archive_cleanup_failure(primary, cleanup)
+                    elif created:
+                        _retain_archive_cleanup_failure(
+                            primary,
+                            ConverterError(
+                                "Created fetch root identity unavailable; owner review required"
+                            ),
+                        )
     except BaseException as caught:
         if primary is not None and caught is not primary:
             _retain_archive_cleanup_failure(primary, caught)
