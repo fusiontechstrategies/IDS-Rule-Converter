@@ -193,6 +193,12 @@ modifiers. See the [Suricata HTTP syntax reference](https://docs.suricata.io/en/
 and [Snort 3 HTTP selectors](https://docs.snort.org/rules/options/payload/http/).
 Automatic dialect inference also rejects mixed underscore forward aliases and
 backward HTTP groups; choose a source dialect only after inspecting the input.
+Valued legacy buffer modifiers are refused when the requested conversion has
+no proven value-preserving mapping, including conversions with
+`--allow-unverified`. Snort 3 to Snort 3 retains its selector arguments, and
+the supported Snort 3 `http_header:field user-agent` to Suricata
+`http.user_agent` mapping remains available. That exception does not apply
+to Snort 2 or Suricata backward modifiers.
 The Suricata buffers `dns_query`, `http_header_names`, `http_host`,
 `http_protocol`, `http_raw_host`, `http_server_body` and `http_user_agent`
 (including dotted forms) have no proven Snort target mapping and are refused
