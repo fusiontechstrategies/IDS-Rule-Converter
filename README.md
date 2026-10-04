@@ -247,6 +247,45 @@ This changes the earlier direct-member output layout. Each call, including
 them. Unsupported atomic no-replace directory publication is refused. Failed
 staging cleanup is limited to that newly created private generation and may
 require owner review if its identity or contents no longer match.
+
+TAR PAX metadata is parsed under a separate object policy before member handling.
+Each extension admits at most 16 fields, each read pass admits at most 4,096 PAX
+fields in total, keywords have a 128-byte limit, and UTF-8 values have a 4,096-byte
+limit. Integer and decimal timestamp fields use a small bounded numeric grammar.
+Each pass also permits at most 100,000 effective field applications, including
+repeated global metadata and local overrides; a valid archive can therefore be
+refused below the ordinary member-count limit when it uses more metadata.
+The existing compressed/decompressed, extension-byte/chain, member, filesystem
+object, path, file-size and total extraction limits still apply.
+
+Local PAX supports `path`, `linkpath`, `size`, `uid`, `gid`, `uname`, `gname`,
+`mtime`, `atime`, `ctime`, `hdrcharset` and `comment`. Global PAX supports only
+the owner, time, charset and comment fields; global `path`, `linkpath` and `size`
+are refused. Charset metadata must specify `ISO-IR 10646 2000 UTF-8`. Its exact
+raw byte range is checked before slicing or decoding the charset value, after
+the existing length bound. Binary PAX, unknown vendor fields and every GNU sparse
+PAX variant are refused before value decoding or sparse-map parsing. Links,
+special files and legacy sparse members remain unsupported. Ordinary USTAR/GNU
+names and common POSIX UTF-8 long paths
+and fractional timestamps remain supported within these limits.
+Empty numeric fields are refused rather than coerced to zero; empty paths still
+fail path admission. Empty owner/comment strings remain text metadata. This is
+a bounded subset of PAX, not support for every POSIX metadata convention. Live
+feed metadata compatibility is not attested by these offline controls.
+
+Where the standard library exposes `_fromtarfile`, PAX following headers use
+its `dircheck=False` extension protocol. This suppresses legacy `AREGTYPE`
+trailing-slash directory inference from a fallback header name before an
+effective local PAX path is applied. Older parsers use their existing public
+`fromtarfile` protocol and retain that legacy inference; this fallback-name edge
+is not supported there. These protocols do not establish compatibility with
+every future standard-library version or provider metadata convention.
+
+The TAR validator returns immutable `AdmittedTarMember` records with only
+`name`, `type`, `size`, `isfile()` and `isdir()`. It no longer returns full
+`TarInfo` objects or extension dictionaries. Both admission and decoding keep
+the standard-library member cache empty between streaming reads. No arbitrary
+TAR metadata is used to change filesystem ownership, timestamps or permissions.
 Windows extraction roots must be a private child below a drive anchor; the drive
 anchor itself is refused, including aliases that present a directory as an anchor.
 
