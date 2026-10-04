@@ -348,13 +348,15 @@ class TarPaxPolicyTests(unittest.TestCase):
         class RawRangeModel:
             def __init__(self):
                 self.comparisons = []
+                self.slices = []
 
             def startswith(self, expected, start, end):
                 self.comparisons.append((expected, start, end))
                 return False
 
             def __getitem__(self, key):
-                raise AssertionError("A refused charset range was sliced")
+                self.slices.append(key)
+                raise IndexError("A refused charset range was sliced")
 
             def decode(self, *args):
                 raise AssertionError("A refused charset range was decoded")
@@ -365,10 +367,12 @@ class TarPaxPolicyTests(unittest.TestCase):
         self.assertEqual(
             buffer.comparisons, [(app.TAR_PAX_UTF8_CHARSET, 4, 4 + len(app.TAR_PAX_UTF8_CHARSET))]
         )
+        self.assertEqual(buffer.slices, [])
         buffer.comparisons.clear()
         with self.assertRaisesRegex(app.ConverterError, "POSIX UTF-8"):
             app.require_pax_charset_range(buffer, 0, len(b"BINARY"))
         self.assertEqual(buffer.comparisons, [])
+        self.assertEqual(buffer.slices, [])
 
     def test_charset_value_refuses_before_decode(self):
         class UndecodedCharset:
@@ -433,7 +437,7 @@ class TarPaxPolicyTests(unittest.TestCase):
             def __getitem__(self, key):
                 if key == charset_range:
                     if events != ["raw_charset"]:
-                        raise AssertionError("The charset value was sliced before raw admission")
+                        raise IndexError("The charset value was sliced before raw admission")
                     events.append("charset_slice")
                 return body[key]
 
