@@ -60,6 +60,11 @@ MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024
 FEED_DEADLINE_SECONDS = 30
 MAX_FEED_METADATA_BYTES = 64 * 1024
 MAX_ARCHIVE_ENTRIES = 20_000
+MAX_TAR_PAX_FIELDS = 16
+MAX_TAR_PAX_TOTAL_FIELDS = 4096
+MAX_TAR_PAX_KEY_BYTES = 128
+MAX_TAR_PAX_VALUE_BYTES = 4096
+MAX_TAR_PAX_APPLICATIONS = 100_000
 MAX_ZIP_DIRECTORY_BYTES = 8 * 1024 * 1024
 MAX_EXTRACTED_BYTES = 512 * 1024 * 1024
 MAX_EXTRACTED_FILE_BYTES = 128 * 1024 * 1024
@@ -4394,8 +4399,105 @@ def safe_archive_name(name: str) -> PurePosixPath:
     return path
 
 
+TAR_PAX_FIELDS = frozenset(
+    {
+        "path",
+        "linkpath",
+        "size",
+        "uid",
+        "gid",
+        "uname",
+        "gname",
+        "mtime",
+        "atime",
+        "ctime",
+        "hdrcharset",
+        "comment",
+    }
+)
+TAR_GLOBAL_PAX_FIELDS = TAR_PAX_FIELDS - {"path", "linkpath", "size"}
+TAR_PAX_UTF8_CHARSET = b"ISO-IR 10646 2000 UTF-8"
+
+
+def require_pax_charset_range(buffer: bytes, start: int, end: int) -> None:
+    """Admit the exact charset bytes without slicing or decoding their range."""
+    if end - start != len(TAR_PAX_UTF8_CHARSET) or not buffer.startswith(
+        TAR_PAX_UTF8_CHARSET, start, end
+    ):
+        raise ConverterError("Only the POSIX UTF-8 TAR PAX charset is supported")
+
+
+def admitted_pax_value(keyword: str, raw_value: bytes, *, global_header: bool) -> str:
+    """Admit a bounded POSIX field before decoding values or applying metadata."""
+    if keyword.startswith("GNU.sparse."):
+        raise ConverterError("Sparse TAR PAX metadata is not supported")
+    allowed = TAR_GLOBAL_PAX_FIELDS if global_header else TAR_PAX_FIELDS
+    if keyword not in allowed:
+        raise ConverterError("TAR PAX field is not supported by the archive policy")
+    if len(raw_value) > MAX_TAR_PAX_VALUE_BYTES:
+        raise ConverterError("TAR PAX value exceeds its byte budget")
+    if keyword == "hdrcharset":
+        require_pax_charset_range(raw_value, 0, len(raw_value))
+    try:
+        value = raw_value.decode("utf-8", "strict")
+    except UnicodeDecodeError as exc:
+        raise ConverterError("TAR PAX metadata must be UTF-8") from exc
+    if "\x00" in value:
+        raise ConverterError("TAR PAX metadata contains a NUL")
+    if keyword in {"size", "uid", "gid"}:
+        pattern = r"[0-9]{1,20}" if keyword == "size" else r"-?[0-9]{1,20}"
+        if re.fullmatch(pattern, value) is None:
+            raise ConverterError("TAR PAX integer exceeds its supported numeric policy")
+        if keyword == "size" and int(value) > MAX_EXTRACTED_FILE_BYTES:
+            raise ConverterError("TAR PAX entry is too large")
+    elif keyword in {"mtime", "atime", "ctime"}:
+        if re.fullmatch(r"-?[0-9]{1,20}(?:\.[0-9]{1,20})?", value) is None:
+            raise ConverterError("TAR PAX timestamp exceeds its supported numeric policy")
+    return value
+
+
+def charge_pax_application(archive, fields: Mapping[str, str]) -> None:
+    """Bound cumulative effective field work, including repeated global metadata."""
+    count = len(fields)
+    if count > len(TAR_PAX_FIELDS) or any(key not in TAR_PAX_FIELDS for key in fields):
+        raise ConverterError("TAR PAX application contains unsupported metadata")
+    applications = getattr(archive, "_ids_pax_applications", 0) + count
+    if applications > MAX_TAR_PAX_APPLICATIONS:
+        raise ConverterError("TAR PAX metadata exceeds its effective application budget")
+    archive._ids_pax_applications = applications
+
+
+def read_pax_following_member(tarinfo, archive):
+    """Follow an extension through the stdlib protocol available on this runtime."""
+    following = getattr(tarinfo, "_fromtarfile", None)
+    if following is not None:
+        # Modern stdlib PAX parsing suppresses legacy AREGTYPE trailing-slash
+        # inference for an extension's following header.
+        return following(archive, dircheck=False)
+    # Older stdlib has only this public reader and retains its legacy inference.
+    return tarinfo.fromtarfile(archive)
+
+
 class BoundedTarInfo(tarfile.TarInfo):
-    """Reject oversized extension metadata before tarfile reads or allocates it."""
+    """Bound extension bytes, PAX objects and work before standard member handling."""
+
+    def _proc_member(self, archive):
+        self._ids_archive = archive
+        return super()._proc_member(archive)
+
+    def _proc_builtin(self, archive):
+        count = getattr(archive, "_ids_member_count", 0) + 1
+        if count > MAX_ARCHIVE_ENTRIES:
+            raise ConverterError("TAR archive exceeds its entry limit")
+        archive._ids_member_count = count
+        return super()._proc_builtin(archive)
+
+    def _apply_pax_info(self, pax_headers, encoding, errors):
+        charge_pax_application(self._ids_archive, pax_headers)
+        super()._apply_pax_info(pax_headers, encoding, errors)
+        # Extraction uses only the effective name/type/size. Keep extension
+        # dictionaries transient even while this one TarInfo is in use.
+        self.pax_headers = {}
 
     def _metadata_budget(self, archive):
         archive._ids_metadata_bytes = getattr(archive, "_ids_metadata_bytes", 0) + self.size
@@ -4410,7 +4512,72 @@ class BoundedTarInfo(tarfile.TarInfo):
 
     def _proc_pax(self, archive):
         self._metadata_budget(archive)
-        return super()._proc_pax(archive)
+        block_size = self._block(self.size)
+        buffer = archive.fileobj.read(block_size)
+        if len(buffer) != block_size:
+            raise ConverterError("TAR PAX metadata is truncated")
+        global_header = self.type == tarfile.XGLTYPE
+        # The only retained global fields are the small supported set below.
+        # No raw_headers list or GNU sparse-map parser is ever constructed.
+        if len(archive.pax_headers) > len(TAR_GLOBAL_PAX_FIELDS) or any(
+            key not in TAR_GLOBAL_PAX_FIELDS for key in archive.pax_headers
+        ):
+            raise ConverterError("TAR global PAX metadata exceeds its supported object policy")
+        fields = archive.pax_headers.copy()
+        position = 0
+        field_count = 0
+        while position < self.size:
+            field_count += 1
+            total = getattr(archive, "_ids_pax_fields", 0) + 1
+            if field_count > MAX_TAR_PAX_FIELDS or total > MAX_TAR_PAX_TOTAL_FIELDS:
+                raise ConverterError("TAR PAX fields exceed their object budget")
+            archive._ids_pax_fields = total
+            space = buffer.find(b" ", position, min(self.size, position + 9))
+            if space < 0 or not buffer[position:space].isdigit():
+                raise ConverterError("TAR PAX metadata has invalid record framing")
+            length = int(buffer[position:space])
+            end = position + length
+            if length < 5 or end > self.size or buffer[end - 1] != 0x0A:
+                raise ConverterError("TAR PAX metadata has invalid record framing")
+            start = space + 1
+            equals = buffer.find(b"=", start, min(end - 1, start + MAX_TAR_PAX_KEY_BYTES + 1))
+            if equals <= start:
+                raise ConverterError("TAR PAX keyword exceeds its supported framing or byte budget")
+            try:
+                keyword = buffer[start:equals].decode("ascii", "strict")
+            except UnicodeDecodeError as exc:
+                raise ConverterError("TAR PAX keywords must be ASCII") from exc
+            # Decide sparse/unknown/global policy before slicing or decoding the
+            # value. All GNU sparse PAX versions therefore refuse at this point.
+            if keyword.startswith("GNU.sparse."):
+                raise ConverterError("Sparse TAR PAX metadata is not supported")
+            allowed = TAR_GLOBAL_PAX_FIELDS if global_header else TAR_PAX_FIELDS
+            if keyword not in allowed:
+                raise ConverterError("TAR PAX field is not supported by the archive policy")
+            if end - equals - 2 > MAX_TAR_PAX_VALUE_BYTES:
+                raise ConverterError("TAR PAX value exceeds its byte budget")
+            if keyword == "hdrcharset":
+                require_pax_charset_range(buffer, equals + 1, end - 1)
+            value = admitted_pax_value(
+                keyword, buffer[equals + 1 : end - 1], global_header=global_header
+            )
+            fields[keyword] = value
+            position = end
+        if global_header:
+            archive.pax_headers = fields
+        try:
+            member = read_pax_following_member(self, archive)
+        except tarfile.HeaderError as exc:
+            raise tarfile.SubsequentHeaderError(str(exc)) from None
+        if not global_header:
+            member._apply_pax_info(fields, archive.encoding, archive.errors)
+            member.offset = self.offset
+            if "size" in fields:
+                offset = member.offset_data
+                if member.isreg() or member.type not in tarfile.SUPPORTED_TYPES:
+                    offset += member._block(member.size)
+                archive.offset = offset
+        return member
 
     def _proc_gnulong(self, archive):
         self._metadata_budget(archive)
@@ -4418,6 +4585,31 @@ class BoundedTarInfo(tarfile.TarInfo):
 
     def _proc_sparse(self, archive):
         raise ConverterError("Sparse TAR members are not supported")
+
+
+@dataclass(frozen=True, slots=True)
+class AdmittedTarMember:
+    """The complete TAR admission data needed by the independent decode pass."""
+
+    name: str
+    type: bytes
+    size: int
+
+    def isfile(self) -> bool:
+        return self.type in {tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.CONTTYPE}
+
+    def isdir(self) -> bool:
+        return self.type == tarfile.DIRTYPE
+
+
+def next_tar_member(archive):
+    """Stream one member without tarfile retaining an accumulating TarInfo cache."""
+    archive.members.clear()
+    archive._ids_extension_count = 0
+    try:
+        return archive.next()
+    finally:
+        archive.members.clear()
 
 
 class DecompressionBudget:
@@ -4467,7 +4659,7 @@ def preflight_archive_input(data: bytes) -> None:
         raise ConverterError("Archive input exceeds the download byte limit")
 
 
-def validate_tar_archive(data: bytes) -> list[tarfile.TarInfo]:
+def validate_tar_archive(data: bytes) -> list[AdmittedTarMember]:
     preflight_archive_input(data)
     if not data.startswith(b"\x1f\x8b"):
         raise ConverterError("Expected a gzip-compressed TAR archive")
@@ -4482,8 +4674,7 @@ def validate_tar_archive(data: bytes) -> list[tarfile.TarInfo]:
             ) as archive,
         ):
             while True:
-                archive._ids_extension_count = 0
-                member = archive.next()
+                member = next_tar_member(archive)
                 if member is None:
                     break
                 if len(members) >= MAX_ARCHIVE_ENTRIES:
@@ -4504,7 +4695,7 @@ def validate_tar_archive(data: bytes) -> list[tarfile.TarInfo]:
                 total += member.size
                 if total > MAX_EXTRACTED_BYTES:
                     raise ConverterError("TAR archive exceeds its extracted byte limit")
-                members.append(member)
+                members.append(AdmittedTarMember(member.name, member.type, member.size))
     except (tarfile.TarError, OSError, EOFError, RecursionError) as exc:
         raise ConverterError(f"Downloaded file is not a valid bounded TAR archive: {exc}") from exc
     check_archive_object_budget(member.name for member in members)
@@ -5112,8 +5303,7 @@ def extract_archive(data: bytes, archive_type: str, output_dir: Path, force: boo
                     ) as archive:
                         member_index = 0
                         while True:
-                            archive._ids_extension_count = 0
-                            member = archive.next()
+                            member = next_tar_member(archive)
                             if member is None:
                                 break
                             if member_index >= len(members):
