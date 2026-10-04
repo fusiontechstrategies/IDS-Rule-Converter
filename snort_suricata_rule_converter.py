@@ -2521,12 +2521,49 @@ def snort2_content_buffer_indexes(
     return associations
 
 
+def legacy_buffer_argument_error(
+    option: RuleOption, source_dialect: str, target: str
+) -> str | None:
+    """Admit a valued legacy selector only with an explicit preserving route."""
+    if option.value is None:
+        return None
+    if source_dialect == target == "snort3":
+        return None
+    if (
+        source_dialect == "snort3"
+        and target == "suricata"
+        and option.key == "http_header"
+        and option.value.strip().lower() == "field user-agent"
+    ):
+        return None
+    return (
+        f"Buffer '{option.name}' argument has no proven value-preserving "
+        f"{source_dialect} to {target} mapping"
+    )
+
+
+def admit_legacy_buffer_arguments(
+    options: Sequence[RuleOption], source_dialect: str, target: str
+) -> None:
+    validate_options_text(options)
+    for option in options:
+        if option.key in LEGACY_TO_DOTTED_BUFFER:
+            error = legacy_buffer_argument_error(option, source_dialect, target)
+            if error is not None:
+                raise ConverterError(error)
+
+
 def transform_snort2_to_snort3(
     options: Sequence[RuleOption], backward_buffers: frozenset[str] | None = None
 ) -> list[RuleOption]:
     validate_options_text(options)
     associations = snort2_content_buffer_indexes(options, backward_buffers)
     associated_buffers = set(associations.values())
+    # Admission precedes suppression, including caller-supplied backward buffers.
+    for buffer_index in associated_buffers:
+        error = legacy_buffer_argument_error(options[buffer_index], "snort2", "snort3")
+        if error is not None:
+            raise ConverterError(error)
     transformed: list[RuleOption] = []
     active_buffer = "pkt_data"
     payload_buffer = "pkt_data"
@@ -2974,6 +3011,7 @@ def transform_to_suricata(
     options: Sequence[RuleOption], source_dialect: str, rule_protocol: str
 ) -> list[RuleOption]:
     source_dialect = concrete_source_dialect(source_dialect)
+    admit_legacy_buffer_arguments(options, source_dialect, "suricata")
     options = normalized_fast_pattern_options(options, source_dialect)
     if sip_relative_cursor_unsafe(options):
         raise ConverterError(
@@ -3080,7 +3118,7 @@ def transform_to_suricata(
 
 def transform_to_snort3(options: Sequence[RuleOption], source_dialect: str) -> list[RuleOption]:
     source_dialect = concrete_source_dialect(source_dialect)
-    validate_options_text(options)
+    admit_legacy_buffer_arguments(options, source_dialect, "snort3")
     if source_dialect == "snort2":
         options = transform_snort2_to_snort3(options)
     if source_dialect == "suricata" and any(
@@ -3355,7 +3393,22 @@ def compatibility_diagnostics(
             )
     for option_index, option in enumerate(rule.options):
         key = option.key
-        if target in {"snort2", "snort3"} and (
+        buffer_argument_error = (
+            legacy_buffer_argument_error(option, source_dialect, target)
+            if key in LEGACY_TO_DOTTED_BUFFER
+            else None
+        )
+        if buffer_argument_error is not None:
+            diagnostics.append(
+                option_diagnostic(
+                    rule,
+                    "error",
+                    "UNSUPPORTED_BUFFER_ARGUMENT",
+                    buffer_argument_error,
+                    option.name,
+                )
+            )
+        elif target in {"snort2", "snort3"} and (
             key in UNMAPPED_SNORT_BUFFERS
             or DOTTED_TO_LEGACY_BUFFER.get(key) in UNMAPPED_SNORT_BUFFERS
         ):
@@ -3395,21 +3448,6 @@ def compatibility_diagnostics(
                         option.name,
                     )
                 )
-        elif (
-            target == "suricata"
-            and key in LEGACY_TO_DOTTED_BUFFER
-            and option.value is not None
-            and not (key == "http_header" and option.value.strip().lower() == "field user-agent")
-        ):
-            diagnostics.append(
-                option_diagnostic(
-                    rule,
-                    "error",
-                    "UNSUPPORTED_BUFFER_ARGUMENT",
-                    f"Option '{option.name}' has an argument that cannot be safely mapped to Suricata 8",
-                    option.name,
-                )
-            )
         elif target == "suricata" and key == "bufferlen":
             if mapped_suricata_bufferlen(option.value) is None:
                 diagnostics.append(
@@ -3556,13 +3594,7 @@ def compatibility_diagnostics(
     ):
         for option in rule.options:
             key = option.key
-            if (
-                key in DOTTED_TO_LEGACY_BUFFER
-                or (
-                    (source_dialect == "snort3" or option.value is not None)
-                    and key in LEGACY_TO_DOTTED_BUFFER
-                )
-            ) and option.value is not None:
+            if key in DOTTED_TO_LEGACY_BUFFER and option.value is not None:
                 diagnostics.append(
                     option_diagnostic(
                         rule,
@@ -4974,9 +5006,23 @@ def _validate_zip_directory_entity(data: bytes, member: zipfile.ZipInfo) -> None
     if member.compress_type != zipfile.ZIP_DEFLATED:
         raise ConverterError("ZIP directory uses an unsupported decoder")
     decoder = zlib.decompressobj(-zlib.MAX_WBITS)
-    decoded = decoder.decompress(memoryview(data)[start:end], 1)
-    if decoded or not decoder.eof or decoder.unconsumed_tail or decoder.unused_data:
-        raise ConverterError("ZIP directory entity did not decode as complete empty content")
+    position, pending = start, b""
+    while True:
+        if not pending and position < end:
+            next_position = min(position + 64 * 1024, end)
+            pending = memoryview(data)[position:next_position]
+            position = next_position
+        input_size = len(pending)
+        decoded = decoder.decompress(pending, 1)
+        pending = decoder.unconsumed_tail
+        if decoded or len(pending) > input_size or decoder.unused_data:
+            raise ConverterError("ZIP directory entity did not decode as complete empty content")
+        if decoder.eof:
+            if pending or position != end:
+                raise ConverterError("ZIP directory entity has input beyond its complete stream")
+            return
+        if (not pending and position == end) or len(pending) == input_size:
+            raise ConverterError("ZIP directory decoder did not complete or make progress")
 
 
 def _validate_zip_file_entity(data: bytes, member: zipfile.ZipInfo) -> None:
