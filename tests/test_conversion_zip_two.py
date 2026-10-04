@@ -53,7 +53,7 @@ class VirtualArchive:
 
     def __getitem__(self, key: slice) -> VirtualBlock:
         if key.step is not None or not 30 <= key.start <= key.stop <= self.size:
-            raise AssertionError("virtual model read outside admitted entity")
+            raise IndexError("virtual model read outside admitted entity")
         self.reads.append((key.start, key.stop))
         return VirtualBlock(key.stop - key.start, key.start)
 
