@@ -261,6 +261,13 @@ This changes the earlier direct-member output layout. Each call, including
 them. Unsupported atomic no-replace directory publication is refused. Failed
 staging cleanup is limited to that newly created private generation and may
 require owner review if its identity or contents no longer match.
+TAR preflight also drains the bounded gzip stream through completion before
+fetch creates its source-specific root. A failed extraction removes that
+invocation's exclusively created root only when its recorded identity is intact
+and it is empty after generation cleanup. Changed identity or remaining content
+refuses removal and retains a cleanup diagnostic. A successfully published
+generation is committed content and is preserved even if later artifact metadata
+publication fails; existing source roots are never reused or removed implicitly.
 Archive components must fit both 255 UTF-8 bytes and 255 Windows UTF-16 code
 units. POSIX extraction also checks the retained destination descriptor's
 `PC_NAME_MAX` and native component encoding before creating a stage; filesystems
@@ -359,6 +366,12 @@ reports/manifests and diff reports retain that digest. On Windows, a retained
 read handle excludes data writers, writable mappings and deletion during the
 read. Existing writable handles are refused; close editors that hold one and
 retry. This does not lock the file after parsing or establish who authored it.
+
+Ruleset record boundaries must use LF or CRLF. Lone CR and other Unicode/control
+line separators are refused with a blocking parse diagnostic before comment or
+record scanning, including inside quoted text. They are never silently normalized
+or accepted through non-strict conversion. Literal escaped rule text such as
+`\r` is unaffected; accepted LF/CRLF text and its raw-byte provenance stay intact.
 
 File admission retains lexical no-follow directory handles or descriptors and
 opens the leaf relative to that retained parent. User-selected symlinks, junctions,
