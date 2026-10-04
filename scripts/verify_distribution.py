@@ -18,6 +18,44 @@ from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
 MODULE = "snort_suricata_rule_converter.py"
+# Installation semantics come from this protected verifier, never the producer's
+# generated metadata or a candidate backend. Pin/version evolution requires an
+# explicit reviewed change here as well as in pyproject.toml.
+APPROVED_BUILD_SYSTEM = {
+    "requires": ["setuptools==84.0.0", "wheel==0.48.0"],
+    "build-backend": "setuptools.build_meta",
+}
+APPROVED_PROJECT = {
+    "name": "ids-rule-converter",
+    "version": "4.0.2",
+    "description": "Loss-aware Snort and Suricata rule conversion toolkit",
+    "readme": "README.md",
+    "requires-python": ">=3.10,<3.15",
+    "license": "Apache-2.0",
+    "license-files": ["LICENSE"],
+    "authors": [{"name": "Fusion Technology Strategies"}],
+    "classifiers": [
+        "Environment :: Console",
+        "Intended Audience :: Developers",
+        "Intended Audience :: Information Technology",
+        "Operating System :: OS Independent",
+        "Programming Language :: Python :: 3 :: Only",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
+        "Programming Language :: Python :: 3.14",
+        "Topic :: Security",
+    ],
+    "scripts": {"ids-rule-converter": "snort_suricata_rule_converter:main"},
+    "urls": {
+        "Repository": "https://github.com/fusiontechstrategies/IDS-Rule-Converter",
+        "Issues": "https://github.com/fusiontechstrategies/IDS-Rule-Converter/issues",
+    },
+}
+APPROVED_SETUPTOOLS = {"py-modules": ["snort_suricata_rule_converter"]}
+APPROVED_ENTRY_POINTS = "[console_scripts]\nids-rule-converter = snort_suricata_rule_converter:main"
+APPROVED_WHEEL_GENERATOR = "setuptools (84.0.0)"
 BLOCKED_SUFFIXES = {".env", ".key", ".p12", ".pem", ".pfx", ".pyc"}
 WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL"} | {
     f"{prefix}{index}" for prefix in ("COM", "LPT") for index in range(1, 10)
@@ -173,6 +211,36 @@ def validate_record(values: dict[str, bytes], record: str) -> None:
             raise ValueError("Wheel RECORD identity differs from the verified member")
 
 
+def validate_installation_contract(configuration: dict) -> None:
+    """Authorize inert TOML without importing or running candidate build code."""
+    if set(configuration) != {"build-system", "project", "tool"}:
+        raise ValueError("Unreviewed top-level pyproject installation contract")
+    if configuration["build-system"] != APPROVED_BUILD_SYSTEM:
+        # Exact spellings also reject URLs, markers, extras, duplicate/case
+        # variants, backend-path and additional requirements or backend keys.
+        raise ValueError("Unreviewed pinned build-system installation contract")
+    project = configuration["project"]
+    if not isinstance(project, dict):
+        raise ValueError("Project installation contract must be a table")
+    permitted_empty = {"dependencies": [], "optional-dependencies": {}, "dynamic": []}
+    if set(project) - set(APPROVED_PROJECT) - set(permitted_empty):
+        raise ValueError("Unreviewed project installation fields")
+    for key, empty in permitted_empty.items():
+        if key in project and (type(project[key]) is not type(empty) or project[key] != empty):
+            raise ValueError("The runtime contract forbids dependency and dynamic declarations")
+    if {key: value for key, value in project.items() if key not in permitted_empty} != (
+        APPROVED_PROJECT
+    ):
+        raise ValueError("Project differs from the protected reviewed installation contract")
+    tool = configuration["tool"]
+    if (
+        not isinstance(tool, dict)
+        or set(tool) != {"setuptools", "ruff"}
+        or tool["setuptools"] != APPROVED_SETUPTOOLS
+    ):
+        raise ValueError("Unreviewed setuptools module or package installation contract")
+
+
 def reviewed_project(source_root: Path) -> dict:
     # Release jobs run Python 3.12 in isolated mode. Python 3.10 test/build users
     # install the pinned tomli compatibility parser, never tagged import paths.
@@ -181,11 +249,14 @@ def reviewed_project(source_root: Path) -> dict:
     except ModuleNotFoundError:
         import tomli as tomllib
     with (source_root / "pyproject.toml").open("rb") as stream:
-        return tomllib.load(stream)
+        configuration = tomllib.load(stream)
+    validate_installation_contract(configuration)
+    return configuration
 
 
 def validate_descriptive_metadata(metadata, source_root: Path, configuration: dict) -> None:
-    project = configuration["project"]
+    validate_installation_contract(configuration)
+    project = APPROVED_PROJECT
     authors = project["authors"]
     if any(set(author) != {"name"} for author in authors):
         raise ValueError("Reviewed author format is unsupported")
@@ -271,6 +342,8 @@ def safe_names(names: list[str]) -> None:
 
 def verify_distribution(dist_dir: Path, source_root: Path, version: str) -> tuple[Path, Path]:
     configuration = reviewed_project(source_root)
+    if version != APPROVED_PROJECT["version"]:
+        raise ValueError("Release version differs from the protected installation contract")
     wheel_name = f"ids_rule_converter-{version}-py3-none-any.whl"
     sdist_name = f"ids_rule_converter-{version}.tar.gz"
     if {path.name for path in dist_dir.iterdir()} != {wheel_name, sdist_name}:
@@ -307,14 +380,7 @@ def verify_distribution(dist_dir: Path, source_root: Path, version: str) -> tupl
                 )
         if set(wheel_metadata.keys()) != {"Wheel-Version", "Generator", "Root-Is-Purelib", "Tag"}:
             raise ValueError("Wheel contains unreviewed installation headers")
-        generator_versions = [
-            requirement.split("==", 1)[1]
-            for requirement in configuration["build-system"]["requires"]
-            if requirement.startswith("setuptools==")
-        ]
-        if len(generator_versions) != 1 or wheel_metadata.get_all("Generator") != [
-            f"setuptools ({generator_versions[0]})"
-        ]:
+        if wheel_metadata.get_all("Generator") != [APPROVED_WHEEL_GENERATOR]:
             raise ValueError("Wheel generator differs from reviewed build system")
         if values[prefix + "top_level.txt"].strip() != MODULE.removesuffix(".py").encode():
             raise ValueError("Wheel top-level module differs from reviewed source")
@@ -334,10 +400,7 @@ def verify_distribution(dist_dir: Path, source_root: Path, version: str) -> tupl
             raise ValueError("Wheel package identity differs from release")
         if details.get_all("Requires-Dist"):
             raise ValueError("The standard-library runtime must have no install dependencies")
-        if (
-            archive.read(entry_points[0]).decode("utf-8").strip()
-            != "[console_scripts]\nids-rule-converter = snort_suricata_rule_converter:main"
-        ):
+        if archive.read(entry_points[0]).decode("utf-8").strip() != APPROVED_ENTRY_POINTS:
             raise ValueError("Wheel CLI entry point differs from release")
     with bounded_sdist(sdist) as archive:
         members = archive.getmembers()
@@ -416,7 +479,7 @@ def verify_distribution(dist_dir: Path, source_root: Path, version: str) -> tupl
             .decode("utf-8")
             .strip()
         )
-        if entries != "[console_scripts]\nids-rule-converter = snort_suricata_rule_converter:main":
+        if entries != APPROVED_ENTRY_POINTS:
             raise ValueError("Source archive entry points differ from reviewed CLI")
         for relative in (MODULE, "LICENSE", "README.md", "pyproject.toml"):
             name = f"ids_rule_converter-{version}/{relative}"

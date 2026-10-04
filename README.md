@@ -143,6 +143,14 @@ content and PCRE literal whitespace rather than collapsing it.
 
 Release verification binds package descriptions, authors, project URLs,
 classifiers, README content, and the wheel generator to the reviewed source.
+The protected verifier separately authorizes the installation contract as inert
+TOML: exactly pinned `setuptools==84.0.0` and `wheel==0.48.0`, the
+`setuptools.build_meta` backend, the current static project identity, one runtime
+module and its intended console script. Runtime dependency, optional dependency
+and dynamic declarations must be absent or typed empty. Extra build selectors,
+backend paths, package discovery, entry points and ambiguous requirements are
+refused before distribution inspection. Future pin or version evolution requires
+an explicit reviewed update to both this contract and `pyproject.toml`.
 Source archives reject unreviewed empty directories and nonportable paths.
 PyPI promotion verifies the copied distribution hashes and rechecks the tag,
 signed commit, main ancestry, and public stable release after environment
@@ -247,6 +255,20 @@ This changes the earlier direct-member output layout. Each call, including
 them. Unsupported atomic no-replace directory publication is refused. Failed
 staging cleanup is limited to that newly created private generation and may
 require owner review if its identity or contents no longer match.
+Archive components must fit both 255 UTF-8 bytes and 255 Windows UTF-16 code
+units. POSIX extraction also checks the retained destination descriptor's
+`PC_NAME_MAX` and native component encoding before creating a stage; filesystems
+without an established finite limit are refused. These limits apply to each
+component, including names supplied through PAX. Previously accepted longer
+component spellings are no longer supported.
+Failure cleanup uses a reverse creation journal, including temporary atomic
+writer files and private Windows writer directories. It checks each object's
+type and recorded identity, attempts the remaining owned objects after an
+individual removal failure, and reports aggregate failures while preserving
+the initiating exception. An unavailable or changed identity still requires
+owner review; cleanup never expands into unowned paths. Library exceptions
+expose `archive_cleanup_failures` and `archive_cleanup_failure_count`; Python
+3.11 and later also attach exception notes.
 
 TAR PAX metadata is parsed under a separate object policy before member handling.
 Each extension admits at most 16 fields, each read pass admits at most 4,096 PAX
