@@ -444,6 +444,10 @@ class ArchiveCleanupTests(unittest.TestCase):
                 on_created(20)
             yield 20
 
+        def fail_generation():
+            with app._archive_generation(ROOT, {}):
+                raise primary
+
         api.object.side_effect = object_
         with (
             patch.object(app.os, "name", "nt"),
@@ -455,9 +459,8 @@ class ArchiveCleanupTests(unittest.TestCase):
                 side_effect=app._ArchiveCleanupError(["one", "two"], 2),
             ) as cleanup,
             self.assertRaises(app.ConverterError) as caught,
-            app._archive_generation(ROOT, {}),
         ):
-            raise primary
+            fail_generation()
         self.assertIs(caught.exception, primary)
         self.assertEqual(primary.archive_cleanup_failure_count, 2)
         self.assertEqual(cleanup.call_args.args[2], "stage-identity")
@@ -641,14 +644,19 @@ class FinalCleanupResidualV2Tests(unittest.TestCase):
         self.assertFalse(hasattr(closing, "archive_cleanup_failure_count"))
         file.__exit__.side_effect = None
         file.__exit__.return_value = True
+
+        def fail_payload():
+            with app._atomic_writer_stream(file):
+                raise primary
+
         primary = app.ConverterError("ordinary body failure")
-        with self.assertRaises(app.ConverterError) as caught, app._atomic_writer_stream(file):
-            raise primary
+        with self.assertRaises(app.ConverterError) as caught:
+            fail_payload()
         self.assertIs(caught.exception, primary)
         file.__exit__.side_effect = OSError("ordinary second close failure")
         primary = app.ConverterError("ordinary body without an original cause")
-        with self.assertRaises(app.ConverterError) as caught, app._atomic_writer_stream(file):
-            raise primary
+        with self.assertRaises(app.ConverterError) as caught:
+            fail_payload()
         self.assertIs(caught.exception, primary)
         self.assertIsNone(primary.__cause__)
         self.assertEqual(primary.args, ("ordinary body without an original cause",))
