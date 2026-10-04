@@ -750,7 +750,7 @@ class FinalFiveGeneration(unittest.TestCase):
                 )
             self.assertFalse((root / (source + ".metadata.json")).exists())
             self.assertFalse((root / (source + ".tar.gz")).exists())
-            self.assertFalse(list((root / source).iterdir()))
+            self.assertFalse((root / source).exists())
 
     def test_mocked_decoder_exception_cleans_its_ordinary_staging_generation(self):
         with tempfile.TemporaryDirectory() as directory:
