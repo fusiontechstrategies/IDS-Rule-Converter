@@ -18,7 +18,7 @@ AMBIGUOUS = 'alert tcp any any -> any 80 (content:"A"; http_header; content:"B";
 
 
 class ExtraHighBoundaries(unittest.TestCase):
-    def test_oversized_or_invalid_content_length_rejected_before_body_read(self):
+    def test_worker_invalid_content_length_rejected_before_body_read(self):
         source_name = next(iter(converter.FEEDS))
         for header in (str(converter.MAX_DOWNLOAD_BYTES + 1), "9" * 10000, "not-a-number", "-1"):
             with self.subTest(header=header[:40]):
@@ -32,7 +32,7 @@ class ExtraHighBoundaries(unittest.TestCase):
                     patch.object(converter.urllib.request, "build_opener", return_value=opener),
                     self.assertRaises(converter.ConverterError),
                 ):
-                    converter.download_feed(source_name)
+                    converter._download_feed_in_worker(source_name)
                 response.read.assert_not_called()
 
     def test_expanded_inline_modifiers_cannot_bypass_option_cap(self):

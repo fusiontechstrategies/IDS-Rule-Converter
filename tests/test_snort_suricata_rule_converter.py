@@ -427,7 +427,9 @@ class FileAndArchiveSafetyTests(unittest.TestCase):
                 stream.getvalue(), "tar.gz", Path(directory), force=False
             )
             self.assertEqual(1, len(written))
-            self.assertTrue((Path(directory) / "rules" / "community.rules").is_file())
+            self.assertTrue(written[0].is_file())
+            self.assertEqual(written[0].parts[-2:], ("rules", "community.rules"))
+            self.assertEqual(written[0].read_bytes(), payload)
 
     def test_windows_drive_archive_name_is_rejected(self) -> None:
         with self.assertRaises(converter.ConverterError):

@@ -51,6 +51,27 @@ parent. Extraction roots cannot be links; fetch uses an exclusively created
 extraction directory. TAR parsing bounds entries, declared file sizes,
 decompressed stream bytes, extension metadata, and extension chains before
 materializing the full member list. Sparse archives are unsupported.
+Every admitted path has one portable spelling and file/directory type, including
+implicit parents. All files decode into a private generation before directory
+publication. Windows creates private directories with explicit current-SID owner
+and protected DACL, then publishes through retained native handles without
+replacement. Linux uses `renameat2(RENAME_NOREPLACE)` and macOS uses
+`renameatx_np(RENAME_EXCL)`; unsupported systems/filesystems are refused. Cleanup
+uses the retained namespace and created-stage identity, never old/user directories.
+Same-user process and operating-system security authorities remain trusted.
+ZIP directory entities also require the empty-content checksum and complete
+empty stored/raw-deflate encoding, using a one-byte output cap. They cannot be
+published solely on declared zero size or on closing an unread standard reader.
+Regular ZIP entities independently require exact stored length or true raw-deflate
+stream completion, no remaining entity input, and matching decoded size and CRC.
+Input and output chunks are capped at 64 KiB; no unrestricted decoder flush or
+whole decoded buffer is used. This validation precedes the unchanged standard
+extraction writer, so both bounded passes must complete before publication.
+Windows drive-anchor extraction roots are refused before native namespace access;
+use an owned private child directory. Retained archive parent handles permit
+read/write sharing without delete, allowing the documented separate kernel target
+open used by FILE_RENAME_INFORMATION. The caller's parent pin need not itself
+request target write-data authority; the source rename handle requests DELETE.
 
 Release builds have read-only repository permissions and use fully hash-locked
 build dependencies. A separate clean runner verifies exact wheel and source
@@ -142,9 +163,21 @@ remain relative, with literal percent signs encoded rather than reinterpreted.
 
 Feed redirects never drain intermediate entities. Every hop must remain on an
 allowlisted HTTPS host, within repeat/hop limits and the shared 30-second request
-deadline. Final-response reads remain byte-bounded and check that same deadline
-before and after each read; a blocking operation is also subject to its socket
-timeout. ZIP helpers preflight the end record and actual central-directory records
+deadline. A parent supervisor enforces one deadline across worker startup, every
+blocking network phase, partial IPC, completion and validation, then kills/reaps
+the child on failure or interruption. Bounded `send_bytes`/`recv_bytes` carry
+network-derived data, with no object unpickling. A supervised receive thread keeps
+partial pipe receipt cancellable. The explicit spawn context uses trusted ordinary
+interpreter/module/caller startup, not isolated mode; library callers need guarded
+import-safe startup. OS creation/termination/reaping latency and unsupported
+frozen/interactive embedding are platform limits. A callable main-thread SIGINT
+handler is deferred across process and reader startup until cleanup owns them,
+then restored and invoked with its original returning or raising behavior.
+Other threads and OS ignore/default dispositions are preserved. Arbitrary
+asynchronous exceptions and forced OS termination are outside this guarantee.
+The child retains socket
+timeouts and byte bounds as additional controls. ZIP helpers preflight the end
+record and actual central-directory records
 before allocating member objects. Inputs are limited to 64 MiB, directory metadata
 to 8 MiB and entries to 20,000. Counts, offsets and parser readback must agree.
 Single-disk conventional ZIP and fixed-size ZIP64 end records are supported;

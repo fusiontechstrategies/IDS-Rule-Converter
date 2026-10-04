@@ -387,7 +387,7 @@ class FinalScanFive(unittest.TestCase):
         ):
             self.redirect(handler)
 
-    def test_actual_download_opener_chain_closes_redirect_entities_without_reading(self):
+    def test_actual_worker_opener_chain_closes_redirect_entities_without_reading(self):
         bodies = []
 
         class RedirectBody(io.BytesIO):
@@ -412,13 +412,13 @@ class FinalScanFive(unittest.TestCase):
                 return response
 
         with patch.object(app.urllib.request, "HTTPSHandler", FixtureHTTPS):
-            result, metadata = app.download_feed(next(iter(app.FEEDS)))
+            result, metadata = app._download_feed_in_worker(next(iter(app.FEEDS)))
         self.assertEqual(result, b"harmless")
         self.assertEqual(metadata["bytes"], 8)
         self.assertEqual([code for _, code in bodies], [302, 302, 200])
         self.assertTrue(all(body.closed for body, _ in bodies))
 
-    def test_final_response_read_cannot_reset_download_deadline(self):
+    def test_worker_response_read_cannot_reset_download_deadline(self):
         response = MagicMock()
         response.__enter__.return_value = response
         source = next(iter(app.FEEDS))
@@ -432,7 +432,7 @@ class FinalScanFive(unittest.TestCase):
             patch.object(app.time, "monotonic", side_effect=[0, 0, 31]),
             self.assertRaisesRegex(app.ConverterError, "deadline"),
         ):
-            app.download_feed(source)
+            app._download_feed_in_worker(source)
         response.read.assert_called_once()
 
     @staticmethod
