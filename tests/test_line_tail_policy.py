@@ -801,7 +801,7 @@ class LineTailCloseV2(unittest.TestCase):
         def publish_generation():
             with (
                 model.environment(),
-                patch.object(app.os, "name", "nt"),
+                patch.object(app, "os", SimpleNamespace(name="nt")),
                 patch.object(app, "_require_windows_archive_child"),
                 app._archive_generation(PureWindowsPath("C:/ordinary-model"), {}),
             ):
