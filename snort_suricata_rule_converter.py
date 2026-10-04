@@ -56,6 +56,8 @@ MAX_PARSED_RULES = 100_000
 MAX_TOTAL_OPTIONS = 1_000_000
 MAX_DIAGNOSTICS = 10_000
 MAX_ARCHIVE_PATH_DEPTH = 32
+MAX_ARCHIVE_COMPONENT_UTF8_BYTES = 255
+MAX_ARCHIVE_COMPONENT_UTF16_UNITS = 255
 MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024
 FEED_DEADLINE_SECONDS = 30
 MAX_FEED_METADATA_BYTES = 64 * 1024
@@ -1299,7 +1301,7 @@ def windows_report_directory_lock(
             kernel.CloseHandle(handle)
 
 
-def windows_private_report_directory(parent, sid):
+def windows_private_report_directory(parent, sid, *, on_created=None):
     """Create the directory with its protected owner DACL already in place."""
     if sys.platform != "win32":
         raise OSError("Windows security APIs require Windows")
@@ -1337,6 +1339,8 @@ def windows_private_report_directory(parent, sid):
         staging = parent / (".govhawk-private-" + os.urandom(16).hex())
         if not kernel.CreateDirectoryW(str(staging), ctypes.byref(attributes)):
             raise ctypes.WinError(ctypes.get_last_error())
+        if on_created is not None:
+            on_created(staging)
         return staging
     finally:
         kernel.LocalFree(descriptor)
@@ -1529,6 +1533,22 @@ def write_output_payload(
         raise ConverterError("Archive entry length differs from its declaration")
 
 
+@contextmanager
+def _atomic_writer_stream(stream):
+    """Keep a payload failure primary when buffered stream finalization fails."""
+    initiating = []
+    try:
+        with stream as handle, _remember_archive_primary_error(initiating):
+            yield handle
+        if initiating:
+            raise initiating[0]  # A stream must not suppress a failed payload.
+    except BaseException as exc:
+        if initiating and exc is not initiating[0]:
+            _retain_archive_cleanup_failure(initiating[0], exc)
+            raise initiating[0] from initiating[0].__cause__
+        raise
+
+
 def atomic_write_bytes(
     path: Path,
     data: bytes | BinaryIO,
@@ -1536,12 +1556,16 @@ def atomic_write_bytes(
     *,
     expected_size: int | None = None,
     protected_inputs: Sequence[InputIdentity] = (),
+    _archive_journal=None,
 ) -> Path:
     destination = ensure_output_path(path, force)
     ensure_outputs_do_not_replace_inputs((destination,), protected_inputs)
     if os.name != "nt":
         directory = open_posix_directory(destination.parent)
         temporary_name = f".ids-{uuid.uuid4().hex}.tmp"
+        primary = None
+        temporary_created = False
+        temporary_identity = None
         try:
             info = os.fstat(directory)
             if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o022:
@@ -1554,7 +1578,20 @@ def atomic_write_bytes(
                 0o600,
                 dir_fd=directory,
             )
-            with os.fdopen(fd, "wb") as handle:
+            temporary_created = True
+            try:
+                if _archive_journal is not None:
+                    temporary_identity = _archive_journal.record_created(
+                        destination.parent / temporary_name, False, descriptor=fd
+                    )
+                else:
+                    info = os.fstat(fd)
+                    temporary_identity = info.st_dev, info.st_ino
+                handle = os.fdopen(fd, "wb")
+            except BaseException:
+                os.close(fd)
+                raise
+            with _atomic_writer_stream(handle) as handle:
                 write_output_payload(handle, data, expected_size)
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -1580,10 +1617,35 @@ def atomic_write_bytes(
                     )
                 except FileExistsError as exc:
                     raise ConverterError(f"Output already exists: {destination}") from exc
+            if _archive_journal is not None:
+                _archive_journal.record_created(destination, False, identity=temporary_identity)
+        except BaseException as exc:
+            primary = exc
+            raise
         finally:
-            with suppress(FileNotFoundError):
-                os.unlink(temporary_name, dir_fd=directory)
-            os.close(directory)
+            try:
+                if temporary_created:
+                    with suppress(FileNotFoundError):
+                        info = os.stat(temporary_name, dir_fd=directory, follow_symlinks=False)
+                        if (
+                            not stat.S_ISREG(info.st_mode)
+                            or (info.st_dev, info.st_ino) != temporary_identity
+                        ):
+                            raise ConverterError(
+                                "Atomic writer temporary identity changed; cleanup refused"
+                            )
+                        os.unlink(temporary_name, dir_fd=directory)
+            except (OSError, ConverterError) as cleanup:
+                if primary is None:
+                    raise
+                _retain_archive_cleanup_failure(primary, cleanup)
+            finally:
+                try:
+                    os.close(directory)
+                except OSError as cleanup:
+                    if primary is None:
+                        raise
+                    _retain_archive_cleanup_failure(primary, cleanup)
         return destination
     sid = current_windows_sid()
     with ExitStack() as locks:
@@ -1593,28 +1655,61 @@ def atomic_write_bytes(
                     parent, parent_sid=sid, require_user_owner=parent == destination.parent
                 )
             )
-        staging = windows_private_report_directory(destination.parent, sid)
-        with windows_report_directory_lock(staging, sid, remove_on_exit=True):
-            temporary = staging / "report"
-            try:
-                with temporary.open("xb") as handle:
-                    write_output_payload(handle, data, expected_size)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                if force:
+        created = None
+        if _archive_journal is not None:
+
+            def created(path):
+                _archive_journal.record_created(path, True, writer_destination=destination)
+
+        staging = windows_private_report_directory(destination.parent, sid, on_created=created)
+        primary = None
+        try:
+            with windows_report_directory_lock(staging, sid, remove_on_exit=True):
+                temporary = staging / "report"
+                temporary_created = False
+                try:
+                    with _atomic_writer_stream(temporary.open("xb")) as handle:
+                        temporary_created = True
+                        temporary_identity = None
+                        if _archive_journal is not None:
+                            temporary_identity = _archive_journal.record_created(
+                                temporary, False, file=handle, writer_destination=destination
+                            )
+                        write_output_payload(handle, data, expected_size)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    if force:
+                        try:
+                            leaf = destination.stat()
+                        except FileNotFoundError:
+                            leaf = None
+                        refuse_input_leaf(leaf, protected_inputs)
+                        os.replace(temporary, destination)
+                    else:
+                        try:
+                            os.link(temporary, destination)
+                        except FileExistsError as exc:
+                            raise ConverterError(f"Output already exists: {destination}") from exc
+                    if _archive_journal is not None:
+                        _archive_journal.record_created(
+                            destination, False, identity=temporary_identity
+                        )
+                except BaseException as exc:
+                    primary = exc
+                    raise
+                finally:
                     try:
-                        leaf = destination.stat()
-                    except FileNotFoundError:
-                        leaf = None
-                    refuse_input_leaf(leaf, protected_inputs)
-                    os.replace(temporary, destination)
-                else:
-                    try:
-                        os.link(temporary, destination)
-                    except FileExistsError as exc:
-                        raise ConverterError(f"Output already exists: {destination}") from exc
-            finally:
-                temporary.unlink(missing_ok=True)
+                        if temporary_created:
+                            temporary.unlink(missing_ok=True)
+                    except OSError as cleanup:
+                        if primary is None:
+                            raise
+                        _retain_archive_cleanup_failure(primary, cleanup)
+        except BaseException as cleanup:
+            if primary is not None and cleanup is not primary:
+                _retain_archive_cleanup_failure(primary, cleanup)
+                raise primary from primary.__cause__
+            raise
     return destination
 
 
@@ -4391,6 +4486,16 @@ def safe_archive_name(name: str) -> PurePosixPath:
     if len(path.parts) > MAX_ARCHIVE_PATH_DEPTH:
         raise ConverterError("Archive path exceeds its depth budget")
     for part in path.parts:
+        try:
+            utf8_bytes = len(part.encode("utf-8"))
+            utf16_units = len(part.encode("utf-16-le")) // 2
+        except UnicodeError as exc:
+            raise ConverterError("Archive component is not portable Unicode") from exc
+        if (
+            utf8_bytes > MAX_ARCHIVE_COMPONENT_UTF8_BYTES
+            or utf16_units > MAX_ARCHIVE_COMPONENT_UTF16_UNITS
+        ):
+            raise ConverterError("Archive component exceeds its portable name budget")
         stem = part.split(".", 1)[0].upper()
         if stem in reserved:
             raise ConverterError(f"Archive contains a Windows device path: {name!r}")
@@ -5028,7 +5133,9 @@ class _WindowsArchiveApi:
         return info.volume, info.index_high, info.index_low
 
     @contextmanager
-    def object(self, parent, name, *, directory, create=False, delete=False, private=False):
+    def object(
+        self, parent, name, *, directory, create=False, delete=False, private=False, on_created=None
+    ):
         c, w = self.ctypes, self.wintypes
         if safe_archive_name(name).parts != (name,):
             raise ConverterError("Native archive operations require one path component")
@@ -5070,6 +5177,8 @@ class _WindowsArchiveApi:
             if descriptor:
                 self.kernel.LocalFree(descriptor)
         try:
+            if create and on_created is not None:
+                on_created(handle)
             validate_windows_input_component(handle, directory=directory)
             if private and directory:
                 verify_windows_parent_security(handle, self.sid, True)
@@ -5169,7 +5278,141 @@ def _publish_posix_generation(parent: int, staging: str, final: str) -> None:
         raise OSError(error, os.strerror(error))
 
 
-def _cleanup_archive_generation(parent, name, identity, graph, api):
+def _retain_archive_cleanup_failure(primary, cleanup):
+    """Keep the initiating exception and expose bounded cleanup diagnostics."""
+    previous = getattr(primary, "archive_cleanup_failures", ())
+    failures = getattr(cleanup, "failures", (str(cleanup)[:512],))
+    primary.archive_cleanup_failure_count = getattr(primary, "archive_cleanup_failure_count", 0) + (
+        getattr(cleanup, "failure_count", len(failures))
+    )
+    primary.archive_cleanup_failures = (previous + tuple(failures))[:100]
+    summary = f"Archive cleanup reported {primary.archive_cleanup_failure_count} failure(s)"
+    primary.archive_cleanup_summary = summary
+    if hasattr(primary, "add_note"):
+        primary.add_note(summary + ": " + "; ".join(primary.archive_cleanup_failures))
+
+
+@contextmanager
+def _remember_archive_primary_error(errors):
+    """Capture the body failure before retained stage handles are released."""
+    try:
+        yield
+    except BaseException as exc:
+        errors.append(exc)
+        raise
+
+
+class _ArchiveCleanupError(ConverterError):
+    def __init__(self, failures, failure_count):
+        self.failures, self.failure_count = tuple(failures), failure_count
+        super().__init__(
+            f"Archive cleanup reported {failure_count} failure(s): " + "; ".join(failures)
+        )
+
+
+class _ArchiveCreationJournal:
+    """Record only exclusive creations and published leaves in this owned stage."""
+
+    def __init__(self, path, staging, api):
+        self.path, self.staging, self.api = path, staging, api
+        self.entries = []
+
+    def record_created(
+        self,
+        path,
+        directory,
+        *,
+        file=None,
+        descriptor=None,
+        identity=None,
+        created_handle=None,
+        writer_destination=None,
+    ):
+        parts = path.relative_to(self.path).parts
+        if not parts:
+            raise ConverterError("Created archive object is outside its private stage")
+        # The successful creation is recorded even if obtaining its identity
+        # or validating its internal spelling fails. Unknown identity requires
+        # owner review and never authorizes guessed deletion.
+        index = len(self.entries)
+        self.entries.append((parts, directory, None))
+        if writer_destination is None:
+            if safe_archive_name("/".join(parts)).parts != parts:
+                raise ConverterError("Created archive object is outside its private stage")
+        else:
+            destination_parts = writer_destination.relative_to(self.path).parts
+            if (
+                self.api is None
+                or safe_archive_name("/".join(destination_parts)).parts != destination_parts
+            ):
+                raise ConverterError("Internal archive writer requires an admitted destination")
+            # One private writer directory replaces the admitted final leaf;
+            # its fixed report leaf adds exactly one internal component. This
+            # does not increase the public archive path-depth admission.
+            prefix = destination_parts[:-1]
+            if (
+                len(parts) != len(prefix) + (1 if directory else 2)
+                or parts[: len(prefix)] != prefix
+                or not re.fullmatch(r"\.govhawk-private-[0-9a-f]{32}", parts[len(prefix)])
+                or (not directory and parts[-1] != "report")
+                or any(safe_archive_name(part).parts != (part,) for part in parts)
+            ):
+                raise ConverterError("Internal archive writer spelling is not admitted")
+        if identity is None:
+            if created_handle is not None:
+                identity = self.api.identity(created_handle)
+            elif file is not None or descriptor is not None:
+                descriptor = file.fileno() if file is not None else descriptor
+                info = os.fstat(descriptor)
+                if not stat.S_ISREG(info.st_mode) or directory:
+                    raise ConverterError("Created archive writer is not a regular file")
+                if self.api is None:
+                    identity = info.st_dev, info.st_ino
+                else:
+                    import msvcrt
+
+                    identity = self.api.identity(msvcrt.get_osfhandle(descriptor))
+            else:
+                with _generation_parent(self.staging, parts[:-1], self.api) as container:
+                    if self.api is None:
+                        info = os.stat(parts[-1], dir_fd=container, follow_symlinks=False)
+                        if not (
+                            stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+                        ):
+                            raise ConverterError("Created archive object has an unexpected type")
+                        identity = info.st_dev, info.st_ino
+                    else:
+                        with self.api.object(
+                            container, parts[-1], directory=directory, private=True
+                        ) as handle:
+                            identity = self.api.identity(handle)
+        self.entries[index] = (parts, directory, identity)
+        return identity
+
+
+def _admit_archive_destination(graph, parent, api):
+    """Check the pinned destination filesystem before creating the stage."""
+    if api is not None:
+        return  # The shared UTF-8/UTF-16 contract precedes native Windows calls.
+    try:
+        limit = os.fpathconf(parent, "PC_NAME_MAX")
+    except (AttributeError, OSError, ValueError) as exc:
+        raise ConverterError("Cannot establish the pinned archive filesystem name limit") from exc
+    if not isinstance(limit, int) or limit <= 0:
+        raise ConverterError("Pinned archive filesystem has no supported finite name limit")
+    for parts in graph:
+        for part in parts:
+            try:
+                size = len(os.fsencode(part))
+            except UnicodeError as exc:
+                raise ConverterError(
+                    "Archive component is not representable on this filesystem"
+                ) from exc
+            if size > limit:
+                raise ConverterError("Archive component exceeds the pinned filesystem name limit")
+
+
+def _cleanup_archive_generation(parent, name, identity, journal, api):
     """Remove only this created private generation, through its retained namespace."""
     with ExitStack() as stack:
         if api is None:
@@ -5186,8 +5429,21 @@ def _cleanup_archive_generation(parent, name, identity, graph, api):
             actual = api.identity(staging)
         if actual != identity:
             raise ConverterError("Staging identity changed; cleanup requires owner review")
-        for parts, directory in sorted(graph.items(), key=lambda item: len(item[0]), reverse=True):
+        failures = []
+        failure_count = 0
+
+        def failed(exc):
+            nonlocal failure_count
+            failure_count += 1
+            if len(failures) < 100:
+                failures.append(f"{type(exc).__name__}: {str(exc)[:512]}")
+
+        for parts, directory, expected in reversed(journal.entries):
             try:
+                if expected is None:
+                    raise ConverterError(
+                        "Created staging object identity is unavailable; cleanup refused"
+                    )
                 with _generation_parent(staging, parts[:-1], api) as container:
                     if api is None:
                         info = os.stat(parts[-1], dir_fd=container, follow_symlinks=False)
@@ -5195,6 +5451,8 @@ def _cleanup_archive_generation(parent, name, identity, graph, api):
                             stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
                         ):
                             raise ConverterError("Staging object type changed; cleanup refused")
+                        if (info.st_dev, info.st_ino) != expected:
+                            raise ConverterError("Staging object identity changed; cleanup refused")
                         if directory:
                             os.rmdir(parts[-1], dir_fd=container)
                         else:
@@ -5203,19 +5461,30 @@ def _cleanup_archive_generation(parent, name, identity, graph, api):
                         with api.object(
                             container, parts[-1], directory=directory, delete=True, private=True
                         ) as entry:
+                            if api.identity(entry) != expected:
+                                raise ConverterError(
+                                    "Staging object identity changed; cleanup refused"
+                                )
                             api.dispose(entry)
             except FileNotFoundError:
                 continue
-    if api is None:
-        info = os.stat(name, dir_fd=parent, follow_symlinks=False)
-        if (info.st_dev, info.st_ino) != identity:
-            raise ConverterError("Staging identity changed; cleanup refused")
-        os.rmdir(name, dir_fd=parent)
-    else:
-        with api.object(parent, name, directory=True, delete=True, private=True) as entry:
-            if api.identity(entry) != identity:
+            except (OSError, ConverterError) as exc:
+                failed(exc)
+    try:
+        if api is None:
+            info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            if not stat.S_ISDIR(info.st_mode) or (info.st_dev, info.st_ino) != identity:
                 raise ConverterError("Staging identity changed; cleanup refused")
-            api.dispose(entry)
+            os.rmdir(name, dir_fd=parent)
+        else:
+            with api.object(parent, name, directory=True, delete=True, private=True) as entry:
+                if api.identity(entry) != identity:
+                    raise ConverterError("Staging identity changed; cleanup refused")
+                api.dispose(entry)
+    except (OSError, ConverterError) as exc:
+        failed(exc)
+    if failure_count:
+        raise _ArchiveCleanupError(failures, failure_count)
 
 
 @contextmanager
@@ -5226,10 +5495,17 @@ def _archive_generation(output_dir: Path, graph):
     staging_path, final_path = output_dir / staging_name, output_dir / final_name
     with _archive_root_namespace(output_dir, api) as parent:
         identity = None
+        journal = None
+        stage_created = False
+        initiating = []
         try:
-            with ExitStack() as stack:
+            _admit_archive_destination(graph, parent, api)
+            with ExitStack() as stack, _remember_archive_primary_error(initiating):
                 if api is None:
                     os.mkdir(staging_name, 0o700, dir_fd=parent)
+                    stage_created = True
+                    info = os.stat(staging_name, dir_fd=parent, follow_symlinks=False)
+                    identity = info.st_dev, info.st_ino
                     owner = stack.enter_context(
                         _input_directory_descriptor(
                             staging_name,
@@ -5239,24 +5515,53 @@ def _archive_generation(output_dir: Path, graph):
                     )
                     staging = owner.fileno()
                     info = os.fstat(staging)
-                    identity = info.st_dev, info.st_ino
+                    if (info.st_dev, info.st_ino) != identity:
+                        raise ConverterError("Staging identity changed during creation")
                 else:
+
+                    def adopt_stage(handle):
+                        nonlocal identity, stage_created
+                        stage_created = True
+                        identity = api.identity(handle)
+
                     staging = stack.enter_context(
-                        api.object(parent, staging_name, directory=True, create=True, private=True)
+                        api.object(
+                            parent,
+                            staging_name,
+                            directory=True,
+                            create=True,
+                            private=True,
+                            on_created=adopt_stage,
+                        )
                     )
-                    identity = api.identity(staging)
+                journal = _ArchiveCreationJournal(staging_path, staging, api)
                 for parts, directory in sorted(graph.items(), key=lambda item: len(item[0])):
                     if not directory:
                         continue
                     with _generation_parent(staging, parts[:-1], api) as container:
                         if api is None:
                             os.mkdir(parts[-1], 0o700, dir_fd=container)
+                            journal.record_created(staging_path.joinpath(*parts), True)
                         else:
+
+                            def adopt_directory(handle, parts=parts):
+                                # Record before native post-creation validation.
+                                journal.record_created(
+                                    staging_path.joinpath(*parts),
+                                    True,
+                                    created_handle=handle,
+                                )
+
                             with api.object(
-                                container, parts[-1], directory=True, create=True, private=True
+                                container,
+                                parts[-1],
+                                directory=True,
+                                create=True,
+                                private=True,
+                                on_created=adopt_directory,
                             ):
                                 pass
-                yield staging_path, final_path
+                yield staging_path, final_path, journal
             if api is None:
                 info = os.stat(staging_name, dir_fd=parent, follow_symlinks=False)
                 if (info.st_dev, info.st_ino) != identity:
@@ -5269,10 +5574,29 @@ def _archive_generation(output_dir: Path, graph):
                     if api.identity(entry) != identity:
                         raise ConverterError("Staging identity changed; publication refused")
                     api.publish(entry, parent, final_name)
-        except BaseException:
+        except BaseException as caught:
+            primary = initiating[0] if initiating else caught
+            if caught is not primary:
+                _retain_archive_cleanup_failure(primary, caught)
             if identity is not None:
-                _cleanup_archive_generation(parent, staging_name, identity, graph, api)
-            raise
+                try:
+                    _cleanup_archive_generation(
+                        parent,
+                        staging_name,
+                        identity,
+                        journal or _ArchiveCreationJournal(staging_path, None, api),
+                        api,
+                    )
+                except (OSError, ConverterError) as cleanup:
+                    _retain_archive_cleanup_failure(primary, cleanup)
+            elif stage_created:
+                _retain_archive_cleanup_failure(
+                    primary,
+                    ConverterError("Created stage identity is unavailable; owner review required"),
+                )
+            if caught is primary:
+                raise
+            raise primary from caught
 
 
 def extract_archive(data: bytes, archive_type: str, output_dir: Path, force: bool) -> list[Path]:
@@ -5294,7 +5618,7 @@ def extract_archive(data: bytes, archive_type: str, output_dir: Path, force: boo
     # force is retained for source compatibility; every call gets a fresh,
     # no-replace generation, so it never grants deletion of existing content.
     try:
-        with _archive_generation(output_dir, graph) as (staging, final):
+        with _archive_generation(output_dir, graph) as (staging, final, journal):
             if archive_type == "tar.gz":
                 with gzip.GzipFile(fileobj=io.BytesIO(data)) as compressed:
                     bounded = DecompressionBudget(compressed)
@@ -5331,6 +5655,7 @@ def extract_archive(data: bytes, archive_type: str, output_dir: Path, force: boo
                                     staging.joinpath(*relative.parts),
                                     extracted,
                                     expected_size=member.size,
+                                    _archive_journal=journal,
                                 )
                             written.append(final.joinpath(*relative.parts))
                         # Consume the bounded gzip tail as well, including its checksum.
@@ -5357,6 +5682,7 @@ def extract_archive(data: bytes, archive_type: str, output_dir: Path, force: boo
                                 staging.joinpath(*relative.parts),
                                 content,
                                 expected_size=member.file_size,
+                                _archive_journal=journal,
                             )
                         written.append(final.joinpath(*relative.parts))
     except (
@@ -5367,7 +5693,13 @@ def extract_archive(data: bytes, archive_type: str, output_dir: Path, force: boo
         RuntimeError,
         zlib.error,
     ) as exc:
-        raise ConverterError(f"Archive decoding or generation publication failed: {exc}") from exc
+        cleanup = getattr(exc, "archive_cleanup_summary", "")
+        detail = f"; {cleanup}" if cleanup else ""
+        error = ConverterError(f"Archive decoding or generation publication failed: {exc}{detail}")
+        if cleanup:
+            error.archive_cleanup_failures = exc.archive_cleanup_failures
+            error.archive_cleanup_failure_count = exc.archive_cleanup_failure_count
+        raise error from exc
     return written
 
 
@@ -6170,11 +6502,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("Interrupted.", file=sys.stderr)
         return 130
-    except ConverterError as exc:
+    except (ConverterError, OSError) as exc:
         print(f"ERROR: {terminal_safe(exc)}", file=sys.stderr)
-        return EXIT_OPERATIONAL_ERROR
-    except OSError as exc:
-        print(f"ERROR: {terminal_safe(exc)}", file=sys.stderr)
+        count = getattr(exc, "archive_cleanup_failure_count", 0)
+        if count:
+            summary = f"Archive cleanup reported {count} failure(s)"
+            failures = getattr(exc, "archive_cleanup_failures", ())
+            detail = ": " + "; ".join(failures) if failures else ""
+            print(f"CLEANUP: {terminal_safe(summary + detail)}", file=sys.stderr)
         return EXIT_OPERATIONAL_ERROR
 
 
