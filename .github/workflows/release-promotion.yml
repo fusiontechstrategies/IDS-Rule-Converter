@@ -84,7 +84,7 @@ jobs:
           path: source-data
           persist-credentials: false
       - name: Download only the authenticated run's immutable candidate
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ steps.identity.outputs.artifact-id }}
           run-id: ${{ github.event.workflow_run.id }}
@@ -139,7 +139,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Download the bound immutable producer artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.verify.outputs.artifact-id }}
           run-id: ${{ github.event.workflow_run.id }}
@@ -183,7 +183,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Download the bound immutable producer artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.verify.outputs.artifact-id }}
           run-id: ${{ github.event.workflow_run.id }}
