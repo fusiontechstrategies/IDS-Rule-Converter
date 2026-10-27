@@ -144,7 +144,7 @@ content and PCRE literal whitespace rather than collapsing it.
 Release verification binds package descriptions, authors, project URLs,
 classifiers, README content, and the wheel generator to the reviewed source.
 The protected verifier separately authorizes the installation contract as inert
-TOML: exactly pinned `setuptools==84.0.0` and `wheel==0.48.0`, the
+TOML: exactly pinned `setuptools==84.2.0` and `wheel==0.48.0`, the
 `setuptools.build_meta` backend, the current static project identity, one runtime
 module and its intended console script. Runtime dependency, optional dependency
 and dynamic declarations must be absent or typed empty. Extra build selectors,

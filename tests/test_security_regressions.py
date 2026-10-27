@@ -316,7 +316,7 @@ class SecurityRegressions(unittest.TestCase):
             verify_distribution.MODULE: (ROOT / verify_distribution.MODULE).read_bytes(),
             prefix + "METADATA": metadata,
             prefix
-            + "WHEEL": b"Wheel-Version: 1.0\nGenerator: setuptools (84.0.0)\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+            + "WHEEL": b"Wheel-Version: 1.0\nGenerator: setuptools (84.2.0)\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
             prefix + "entry_points.txt": entry,
             prefix + "top_level.txt": b"snort_suricata_rule_converter\n",
             prefix + "licenses/LICENSE": (ROOT / "LICENSE").read_bytes(),

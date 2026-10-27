@@ -34,18 +34,18 @@ class InstallationContractTests(unittest.TestCase):
         verifier.validate_installation_contract(configuration)
         self.assertEqual(configuration["project"]["scripts"], verifier.APPROVED_PROJECT["scripts"])
         self.assertEqual(
-            configuration["build-system"]["requires"], ["setuptools==84.0.0", "wheel==0.48.0"]
+            configuration["build-system"]["requires"], ["setuptools==84.2.0", "wheel==0.48.0"]
         )
 
     def test_requirement_pin_spelling_duplicates_and_selectors_refuse_as_inert_data(self):
         variants = (
-            ["setuptools==84.0.0", "wheel==0.48.0", "extra-package==1.0"],
-            ["setuptools==84.0.0", "wheel==0.48.0", "wheel==0.48.0"],
-            ["Setuptools==84.0.0", "wheel==0.48.0"],
-            ["setuptools==84.0.0", "Wheel==0.48.0"],
-            ["setuptools==84.0.1", "wheel==0.48.0"],
-            ["setuptools==84.0.0; python_version>='3.10'", "wheel==0.48.0"],
-            ["setuptools[extra]==84.0.0", "wheel==0.48.0"],
+            ["setuptools==84.2.0", "wheel==0.48.0", "extra-package==1.0"],
+            ["setuptools==84.2.0", "wheel==0.48.0", "wheel==0.48.0"],
+            ["Setuptools==84.2.0", "wheel==0.48.0"],
+            ["setuptools==84.2.0", "Wheel==0.48.0"],
+            ["setuptools==84.2.1", "wheel==0.48.0"],
+            ["setuptools==84.2.0; python_version>='3.10'", "wheel==0.48.0"],
+            ["setuptools[extra]==84.2.0", "wheel==0.48.0"],
             ["setuptools @ https://example.invalid/package.whl", "wheel==0.48.0"],
         )
         for requirements in variants:

@@ -22,7 +22,7 @@ MODULE = "snort_suricata_rule_converter.py"
 # generated metadata or a candidate backend. Pin/version evolution requires an
 # explicit reviewed change here as well as in pyproject.toml.
 APPROVED_BUILD_SYSTEM = {
-    "requires": ["setuptools==84.0.0", "wheel==0.48.0"],
+    "requires": ["setuptools==84.2.0", "wheel==0.48.0"],
     "build-backend": "setuptools.build_meta",
 }
 APPROVED_PROJECT = {
@@ -55,7 +55,7 @@ APPROVED_PROJECT = {
 }
 APPROVED_SETUPTOOLS = {"py-modules": ["snort_suricata_rule_converter"]}
 APPROVED_ENTRY_POINTS = "[console_scripts]\nids-rule-converter = snort_suricata_rule_converter:main"
-APPROVED_WHEEL_GENERATOR = "setuptools (84.0.0)"
+APPROVED_WHEEL_GENERATOR = "setuptools (84.2.0)"
 BLOCKED_SUFFIXES = {".env", ".key", ".p12", ".pem", ".pfx", ".pyc"}
 WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL"} | {
     f"{prefix}{index}" for prefix in ("COM", "LPT") for index in range(1, 10)
