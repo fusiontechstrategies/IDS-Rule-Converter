@@ -62,6 +62,7 @@ jobs:
         run: python -m bandit -q -r snort_suricata_rule_converter.py scripts
 
       - name: Audit development dependencies
+        if: matrix.python != '3.10'
         run: python -m pip_audit -r requirements-dev.txt
 
       - name: Compile
