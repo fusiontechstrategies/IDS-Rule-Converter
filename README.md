@@ -12,6 +12,8 @@ validating, analyzing, comparing, and converting Snort and Suricata rules. It
 defaults to refusing uncertain translations instead of silently dropping or
 weakening detection logic.
 
+> **Project status: maintained public release.** Version 4.0.2 is the current verified release. The converter supports documented Snort 2, Snort 3, and Suricata 8 lanes, but it does not promise that every engine feature has a lossless translation. Rejected and partial results are deliberate safety outcomes.
+
 The runtime has no third-party Python dependencies. Copy
 `snort_suricata_rule_converter.py` to a system with Python 3.10 or newer and run
 it directly.
@@ -92,6 +94,10 @@ Constructed test data. Strict mode writes no converted ruleset when one mapping
 is unsafe. An explicit partial export preserves accepted rules, rejected source
 rules, and the report as one review set. Native target validation is still
 required.
+
+### Help test difficult rules
+
+Detection engineers can contribute the most by sharing a minimal, anonymized rule whose semantics are unclear across engines. Remove organization names, internal addresses, proprietary intelligence, and licensed rule text before sharing. Include the source dialect, intended target, expected behavior, and native engine version in [GitHub Discussions](https://github.com/fusiontechstrategies/IDS-Rule-Converter/discussions). A refused conversion is useful evidence when no safe mapping exists.
 
 ## Commands
 
@@ -433,6 +439,11 @@ commands, container digests, and scope are recorded in
 | `1` | Operational failure, unsafe path, network failure, or invalid invocation |
 | `2` | Validation findings, conflicts, rejected rules, or an intentional partial result |
 | `130` | Interrupted by the operator |
+
+## Related Fusion projects
+
+- [Fool's Gold](https://github.com/fusiontechstrategies/Fools-Gold) is an offline cyber-decoy detection and assurance pilot seeking real integration validation.
+- Explore the complete [Fusion Technology Strategies public portfolio](https://github.com/fusiontechstrategies/FusionTechStrategies).
 
 ## Development
 
