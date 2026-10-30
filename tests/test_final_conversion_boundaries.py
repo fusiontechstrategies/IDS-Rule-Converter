@@ -22,6 +22,74 @@ RULE = 'alert tcp any any -> any any (content:"marker"; sid:1001;)'
 
 
 class ConversionBoundaries(unittest.TestCase):
+    def test_cross_engine_relative_isdataat_fails_closed(self):
+        for source, target in (
+            ("snort2", "suricata"),
+            ("snort3", "suricata"),
+            ("suricata", "snort2"),
+            ("suricata", "snort3"),
+        ):
+            for value in ("!0,relative", "!1, relative", "2,relative"):
+                parsed = app.RuleParser().parse_text(
+                    f'alert udp any any -> any any (content:"abc"; isdataat:{value}; sid:1001;)'
+                )
+                for strict in (True, False):
+                    with self.subTest(source=source, target=target, value=value, strict=strict):
+                        result = app.convert_rules(
+                            parsed.rules,
+                            target,
+                            strict=strict,
+                            source_dialect=source,
+                        )
+                        self.assertEqual(result.rules, [])
+                        self.assertIn(
+                            "UNSAFE_RELATIVE_ISDATAAT_MAPPING",
+                            {item.code for item in result.errors},
+                        )
+
+    def test_cross_engine_urilen_fails_closed(self):
+        for source, target in (
+            ("snort2", "suricata"),
+            ("snort3", "suricata"),
+            ("suricata", "snort2"),
+            ("suricata", "snort3"),
+        ):
+            for value in ("2<>10", ">20", ">20,raw"):
+                parsed = app.RuleParser().parse_text(
+                    f"alert tcp any any -> any any (urilen:{value}; sid:1001;)"
+                )
+                result = app.convert_rules(parsed.rules, target, source_dialect=source)
+                with self.subTest(source=source, target=target, value=value):
+                    self.assertEqual(result.rules, [])
+                    self.assertIn("UNSAFE_URILEN_MAPPING", {item.code for item in result.errors})
+
+    def test_snort3_rejects_legacy_http_pcre_flags(self):
+        for source in ("snort2", "suricata"):
+            for flags in ("U", "H", "P", "UR"):
+                parsed = app.RuleParser().parse_text(
+                    f'alert tcp any any -> any any (pcre:"/admin/{flags}"; sid:1001;)'
+                )
+                for strict in (True, False):
+                    with self.subTest(source=source, flags=flags, strict=strict):
+                        result = app.convert_rules(
+                            parsed.rules,
+                            "snort3",
+                            strict=strict,
+                            source_dialect=source,
+                        )
+                        self.assertEqual(result.rules, [])
+                        self.assertIn(
+                            "UNSUPPORTED_SNORT3_PCRE_FLAGS",
+                            {item.code for item in result.errors},
+                        )
+
+        parsed = app.RuleParser().parse_text(
+            'alert tcp any any -> any any (content:"admin"; pcre:"/admin/i"; sid:1001;)'
+        )
+        result = app.convert_rules(parsed.rules, "snort3", source_dialect="snort2")
+        self.assertFalse(result.errors)
+        self.assertEqual(len(result.rules), 1)
+
     def test_sip_generated_match_restores_packet_and_prior_file_buffers(self):
         for shorthand in ("sip_method:INVITE;", "sip_stat_code:200;", "sip_stat_code:2;"):
             for selector, expected in (
@@ -135,7 +203,12 @@ class ConversionBoundaries(unittest.TestCase):
                 )
                 self.assertEqual(result.rules, [])
                 self.assertTrue(result.errors)
-            with self.assertRaisesRegex(app.ConverterError, "cannot preserve its cursor"):
+            expected_error = (
+                "different relative isdataat"
+                if operation.startswith("isdataat")
+                else "cannot preserve its cursor"
+            )
+            with self.assertRaisesRegex(app.ConverterError, expected_error):
                 app.render_rule(parsed.rules[0], "suricata", source_dialect="snort2")
 
     def test_neutral_options_do_not_erase_backward_pattern_cursor_provenance(self):
@@ -187,9 +260,22 @@ class ConversionBoundaries(unittest.TestCase):
                         result = app.convert_rules(
                             parsed.rules, target, strict=strict, source_dialect="snort2"
                         )
-                        self.assertFalse(result.errors, (target, operation, result.errors))
-                        self.assertEqual(len(result.rules), 1)
-                    self.assertIn("fresh", app.render_rule(parsed.rules[0], target, "snort2"))
+                        if target == "suricata" and operation.startswith("isdataat"):
+                            self.assertEqual(result.rules, [])
+                            self.assertIn(
+                                "UNSAFE_RELATIVE_ISDATAAT_MAPPING",
+                                {item.code for item in result.errors},
+                            )
+                        else:
+                            self.assertFalse(result.errors, (target, operation, result.errors))
+                            self.assertEqual(len(result.rules), 1)
+                    if target == "suricata" and operation.startswith("isdataat"):
+                        with self.assertRaisesRegex(
+                            app.ConverterError, "different relative isdataat"
+                        ):
+                            app.render_rule(parsed.rules[0], target, "snort2")
+                    else:
+                        self.assertIn("fresh", app.render_rule(parsed.rules[0], target, "snort2"))
 
         # Two backward-selected contents can safely share their own URI cursor.
         parsed = app.RuleParser().parse_text(
