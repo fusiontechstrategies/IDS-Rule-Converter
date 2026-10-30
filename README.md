@@ -12,8 +12,10 @@ validating, analyzing, comparing, and converting Snort and Suricata rules. It
 defaults to refusing uncertain translations instead of silently dropping or
 weakening detection logic.
 
+> **Project status: maintained public release.** Version 4.0.2 is the current verified release. The converter supports documented Snort 2, Snort 3, and Suricata 8 lanes, but it does not promise that every engine feature has a lossless translation. Rejected and partial results are deliberate safety outcomes.
+
 The runtime has no third-party Python dependencies. Copy
-`snort_suricata_rule_converter.py` to a system with Python 3.10 or newer and run
+`snort_suricata_rule_converter.py` to a system with Python 3.12 or newer and run
 it directly.
 
 Version 4.0.2 is the current release. Download the verified
@@ -93,6 +95,10 @@ is unsafe. An explicit partial export preserves accepted rules, rejected source
 rules, and the report as one review set. Native target validation is still
 required.
 
+### Help test difficult rules
+
+Detection engineers can contribute the most by sharing a minimal, anonymized rule whose semantics are unclear across engines. Remove organization names, internal addresses, proprietary intelligence, and licensed rule text before sharing. Include the source dialect, intended target, expected behavior, and native engine version in [GitHub Discussions](https://github.com/fusiontechstrategies/IDS-Rule-Converter/discussions). A refused conversion is useful evidence when no safe mapping exists.
+
 ## Commands
 
 | Command | Purpose |
@@ -154,8 +160,10 @@ an explicit reviewed update to both this contract and `pyproject.toml`.
 Source archives reject unreviewed empty directories and nonportable paths.
 PyPI promotion verifies the copied distribution hashes and rechecks the tag,
 signed commit, main ancestry, and public stable release after environment
-approval. Python 3.10 development checks use the pinned `tomli` compatibility
-parser; the runtime CLI still uses only the standard library.
+approval. The runtime CLI uses only the standard library. Python 3.10 reached
+end of life on October 1, 2026; repository source and future releases require
+Python 3.12 through 3.14. The already-published v4.0.2 metadata cannot be
+changed in place and still records its historical Python 3.10 compatibility.
 
 The default behavior is intentionally conservative:
 
@@ -280,8 +288,8 @@ type and recorded identity, attempts the remaining owned objects after an
 individual removal failure, and reports aggregate failures while preserving
 the initiating exception. An unavailable or changed identity still requires
 owner review; cleanup never expands into unowned paths. Library exceptions
-expose `archive_cleanup_failures` and `archive_cleanup_failure_count`; Python
-3.11 and later also attach exception notes.
+expose `archive_cleanup_failures` and `archive_cleanup_failure_count`; supported
+Python versions also attach exception notes.
 
 TAR PAX metadata is parsed under a separate object policy before member handling.
 Each extension admits at most 16 fields, each read pass admits at most 4,096 PAX
@@ -407,7 +415,7 @@ available; native Panorama validation is still required before deployment.
 The 4.0.1 release-readiness tree contains 64 automated tests covering parsing,
 conversion, reports, Panorama checks, overwrite controls, URL and redirect
 policy, malicious archives, repository text policy, and deterministic release
-construction. CI exercises Python 3.10 through 3.14 on Linux, Python 3.12 on
+construction. CI exercises Python 3.12 through 3.14 on Linux, Python 3.12 on
 Windows and macOS, and both conversion directions against pinned Snort 3.10.0.0
 and Suricata 8.0.6 containers.
 
@@ -433,6 +441,11 @@ commands, container digests, and scope are recorded in
 | `1` | Operational failure, unsafe path, network failure, or invalid invocation |
 | `2` | Validation findings, conflicts, rejected rules, or an intentional partial result |
 | `130` | Interrupted by the operator |
+
+## Related Fusion projects
+
+- [Fool's Gold](https://github.com/fusiontechstrategies/Fools-Gold) is an offline cyber-decoy detection and assurance pilot seeking real integration validation.
+- Explore the complete [Fusion Technology Strategies public portfolio](https://github.com/fusiontechstrategies/FusionTechStrategies).
 
 ## Development
 

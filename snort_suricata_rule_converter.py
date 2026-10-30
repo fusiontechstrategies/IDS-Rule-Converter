@@ -37,7 +37,7 @@ from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, BinaryIO
 
@@ -646,7 +646,7 @@ class ConversionResult:
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def unquote(value: str) -> str:
@@ -3385,6 +3385,9 @@ def compatibility_diagnostics(
             option_diagnostic(rule, "error", "UNSAFE_FAST_PATTERN_MAPPING", str(exc))
         )
     unverified: Counter[str] = Counter()
+    crosses_snort_suricata_boundary = (
+        target == "suricata" and source_dialect in {"snort2", "snort3"}
+    ) or (target in {"snort2", "snort3"} and source_dialect == "suricata")
     if rule.action not in TARGET_ACTIONS[target]:
         diagnostics.append(
             option_diagnostic(
@@ -3486,6 +3489,47 @@ def compatibility_diagnostics(
                     "error",
                     "UNSUPPORTED_BUFFER_ARGUMENT",
                     buffer_argument_error,
+                    option.name,
+                )
+            )
+        elif (
+            target == "snort3"
+            and source_dialect != "snort3"
+            and key == "pcre"
+            and option.value is not None
+            and set(pcre_flags(option.value)) - set("ismxAEGOR")
+        ):
+            diagnostics.append(
+                option_diagnostic(
+                    rule,
+                    "error",
+                    "UNSUPPORTED_SNORT3_PCRE_FLAGS",
+                    "Snort 3 conversion cannot preserve legacy HTTP-specific or unknown PCRE flags; use an explicit sticky buffer",
+                    option.name,
+                )
+            )
+        elif (
+            crosses_snort_suricata_boundary
+            and key == "isdataat"
+            and option.value is not None
+            and re.search(r"(?:^|,)\s*relative\s*(?:,|$)", option.value, re.IGNORECASE)
+        ):
+            diagnostics.append(
+                option_diagnostic(
+                    rule,
+                    "error",
+                    "UNSAFE_RELATIVE_ISDATAAT_MAPPING",
+                    "Snort and Suricata use different relative isdataat offsets and buffer semantics",
+                    option.name,
+                )
+            )
+        elif crosses_snort_suricata_boundary and key == "urilen":
+            diagnostics.append(
+                option_diagnostic(
+                    rule,
+                    "error",
+                    "UNSAFE_URILEN_MAPPING",
+                    "Snort and Suricata use different urilen range endpoints and default buffers",
                     option.name,
                 )
             )
