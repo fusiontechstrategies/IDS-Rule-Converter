@@ -30,7 +30,7 @@ APPROVED_PROJECT = {
     "version": "4.0.2",
     "description": "Loss-aware Snort and Suricata rule conversion toolkit",
     "readme": "README.md",
-    "requires-python": ">=3.10,<3.15",
+    "requires-python": ">=3.11,<3.15",
     "license": "Apache-2.0",
     "license-files": ["LICENSE"],
     "authors": [{"name": "Fusion Technology Strategies"}],
@@ -40,7 +40,6 @@ APPROVED_PROJECT = {
         "Intended Audience :: Information Technology",
         "Operating System :: OS Independent",
         "Programming Language :: Python :: 3 :: Only",
-        "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
         "Programming Language :: Python :: 3.13",
@@ -242,12 +241,9 @@ def validate_installation_contract(configuration: dict) -> None:
 
 
 def reviewed_project(source_root: Path) -> dict:
-    # Release jobs run Python 3.12 in isolated mode. Python 3.10 test/build users
-    # install the pinned tomli compatibility parser, never tagged import paths.
-    try:
-        import tomllib
-    except ModuleNotFoundError:
-        import tomli as tomllib
+    # Release jobs run on supported Python versions with the standard TOML parser.
+    import tomllib
+
     with (source_root / "pyproject.toml").open("rb") as stream:
         configuration = tomllib.load(stream)
     validate_installation_contract(configuration)
@@ -297,7 +293,7 @@ def validate_metadata(metadata, source_root: Path, configuration: dict) -> None:
         raise ValueError("Package metadata contains unreviewed installation semantics")
     required = {
         "Metadata-Version": "2.4",
-        "Requires-Python": "<3.15,>=3.10",
+        "Requires-Python": "<3.15,>=3.11",
         "Description-Content-Type": "text/markdown",
         "License-Expression": "Apache-2.0",
         "License-File": "LICENSE",

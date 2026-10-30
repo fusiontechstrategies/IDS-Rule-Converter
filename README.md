@@ -15,7 +15,7 @@ weakening detection logic.
 > **Project status: maintained public release.** Version 4.0.2 is the current verified release. The converter supports documented Snort 2, Snort 3, and Suricata 8 lanes, but it does not promise that every engine feature has a lossless translation. Rejected and partial results are deliberate safety outcomes.
 
 The runtime has no third-party Python dependencies. Copy
-`snort_suricata_rule_converter.py` to a system with Python 3.10 or newer and run
+`snort_suricata_rule_converter.py` to a system with Python 3.11 or newer and run
 it directly.
 
 Version 4.0.2 is the current release. Download the verified
@@ -160,8 +160,10 @@ an explicit reviewed update to both this contract and `pyproject.toml`.
 Source archives reject unreviewed empty directories and nonportable paths.
 PyPI promotion verifies the copied distribution hashes and rechecks the tag,
 signed commit, main ancestry, and public stable release after environment
-approval. Python 3.10 development checks use the pinned `tomli` compatibility
-parser; the runtime CLI still uses only the standard library.
+approval. The runtime CLI uses only the standard library. Python 3.10 reached
+end of life on October 1, 2026; repository source and future releases require
+Python 3.11 through 3.14. The already-published v4.0.2 metadata cannot be
+changed in place and still records its historical Python 3.10 compatibility.
 
 The default behavior is intentionally conservative:
 
@@ -413,7 +415,7 @@ available; native Panorama validation is still required before deployment.
 The 4.0.1 release-readiness tree contains 64 automated tests covering parsing,
 conversion, reports, Panorama checks, overwrite controls, URL and redirect
 policy, malicious archives, repository text policy, and deterministic release
-construction. CI exercises Python 3.10 through 3.14 on Linux, Python 3.12 on
+construction. CI exercises Python 3.11 through 3.14 on Linux, Python 3.12 on
 Windows and macOS, and both conversion directions against pinned Snort 3.10.0.0
 and Suricata 8.0.6 containers.
 
