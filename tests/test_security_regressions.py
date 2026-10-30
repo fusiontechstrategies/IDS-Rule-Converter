@@ -153,7 +153,7 @@ class SecurityRegressions(unittest.TestCase):
 
         metadata = email.message_from_string(
             "Metadata-Version: 2.4\nName: ids-rule-converter\nVersion: 4.0.2\n"
-            "Requires-Python: <3.15,>=3.11\nDescription-Content-Type: text/markdown\n"
+            "Requires-Python: <3.15,>=3.12\nDescription-Content-Type: text/markdown\n"
             "License-Expression: Apache-2.0\nLicense-File: LICENSE\nProvides-Extra: unreviewed\n"
         )
         with self.assertRaisesRegex(ValueError, "unreviewed installation semantics"):
@@ -300,7 +300,7 @@ class SecurityRegressions(unittest.TestCase):
         version = "4.0.2"
         wheel = directory / f"ids_rule_converter-{version}-py3-none-any.whl"
         sdist = directory / f"ids_rule_converter-{version}.tar.gz"
-        metadata = f"Metadata-Version: 2.4\nName: ids-rule-converter\nVersion: {version}\nRequires-Python: <3.15,>=3.11\nDescription-Content-Type: text/markdown\nLicense-Expression: Apache-2.0\nLicense-File: LICENSE\n"
+        metadata = f"Metadata-Version: 2.4\nName: ids-rule-converter\nVersion: {version}\nRequires-Python: <3.15,>=3.12\nDescription-Content-Type: text/markdown\nLicense-Expression: Apache-2.0\nLicense-File: LICENSE\n"
         project = verify_distribution.reviewed_project(ROOT)["project"]
         metadata += f"Summary: {project['description']}\nAuthor: {project['authors'][0]['name']}\n"
         metadata += "".join(

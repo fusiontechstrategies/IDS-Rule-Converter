@@ -7,7 +7,7 @@ name = "ids-rule-converter"
 version = "4.0.2"
 description = "Loss-aware Snort and Suricata rule conversion toolkit"
 readme = "README.md"
-requires-python = ">=3.11,<3.15"
+requires-python = ">=3.12,<3.15"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "Fusion Technology Strategies" }]
@@ -17,7 +17,6 @@ classifiers = [
   "Intended Audience :: Information Technology",
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3 :: Only",
-  "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
@@ -36,7 +35,7 @@ py-modules = ["snort_suricata_rule_converter"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
 extend-exclude = [".local-reference"]
 
 [tool.ruff.format]

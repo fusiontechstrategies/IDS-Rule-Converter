@@ -30,7 +30,7 @@ APPROVED_PROJECT = {
     "version": "4.0.2",
     "description": "Loss-aware Snort and Suricata rule conversion toolkit",
     "readme": "README.md",
-    "requires-python": ">=3.11,<3.15",
+    "requires-python": ">=3.12,<3.15",
     "license": "Apache-2.0",
     "license-files": ["LICENSE"],
     "authors": [{"name": "Fusion Technology Strategies"}],
@@ -40,7 +40,6 @@ APPROVED_PROJECT = {
         "Intended Audience :: Information Technology",
         "Operating System :: OS Independent",
         "Programming Language :: Python :: 3 :: Only",
-        "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
         "Programming Language :: Python :: 3.13",
         "Programming Language :: Python :: 3.14",
@@ -293,7 +292,7 @@ def validate_metadata(metadata, source_root: Path, configuration: dict) -> None:
         raise ValueError("Package metadata contains unreviewed installation semantics")
     required = {
         "Metadata-Version": "2.4",
-        "Requires-Python": "<3.15,>=3.11",
+        "Requires-Python": "<3.15,>=3.12",
         "Description-Content-Type": "text/markdown",
         "License-Expression": "Apache-2.0",
         "License-File": "LICENSE",

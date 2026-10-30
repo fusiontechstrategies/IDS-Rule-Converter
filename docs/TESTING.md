@@ -23,7 +23,7 @@ The standard-library `unittest` suite contains 64 tests covering:
 - Repository punctuation policy
 - Exact, deterministic release assets, checksums, SPDX metadata, and evidence
 
-The candidate suite runs in hosted CI on Linux with Python 3.11 through 3.14 and
+The candidate suite runs in hosted CI on Linux with Python 3.12 through 3.14 and
 on Windows and macOS with Python 3.12. The optional local third-party corpus test
 is skipped because its vendor-owned inputs are deliberately not stored in Git.
 
