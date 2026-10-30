@@ -1,5 +1,9 @@
 # IDS Rule Converter
 
+<p align="center">
+  <img src=".github/assets/social-preview.jpg" width="960" alt="IDS Rule Converter: Translate. Verify. Fail closed.">
+</p>
+
 [![CI](https://github.com/fusiontechstrategies/IDS-Rule-Converter/actions/workflows/ci.yml/badge.svg)](https://github.com/fusiontechstrategies/IDS-Rule-Converter/actions/workflows/ci.yml)
 [![Engine Validation](https://github.com/fusiontechstrategies/IDS-Rule-Converter/actions/workflows/engine-validation.yml/badge.svg)](https://github.com/fusiontechstrategies/IDS-Rule-Converter/actions/workflows/engine-validation.yml)
 [![Security](https://github.com/fusiontechstrategies/IDS-Rule-Converter/actions/workflows/security.yml/badge.svg)](https://github.com/fusiontechstrategies/IDS-Rule-Converter/actions/workflows/security.yml)
@@ -57,25 +61,37 @@ IDS Rule Converter provides:
 
 ## Quick start
 
-```text
-python snort_suricata_rule_converter.py --help
-python snort_suricata_rule_converter.py validate input.rules
-python snort_suricata_rule_converter.py analyze input.rules --output analysis.json
+After installing the pinned PyPI package above, create a harmless synthetic rule
+and exercise the installed command:
+
+```powershell
+@'
+alert tcp any any -> any 443 (msg:"Synthetic TLS marker"; flow:to_server,established; content:"|16 03|"; depth:2; sid:1000001; rev:1;)
+'@ | Set-Content -LiteralPath input.rules -Encoding utf8
+
+ids-rule-converter --help
+ids-rule-converter validate input.rules
+ids-rule-converter analyze input.rules --output analysis.json
 ```
 
 Convert a Snort 3 ruleset to Suricata. Strict mode is the default, so no ruleset
 is written if any rule has an unsafe or unverified mapping.
 
-```text
-python snort_suricata_rule_converter.py convert input.rules --source-dialect snort3 --target suricata --output converted.rules --report conversion.json
+```powershell
+ids-rule-converter convert input.rules --source-dialect snort3 --target suricata --output converted.rules --report conversion.json
 ```
 
 To export only the verified subset, preserve every rejected source rule, and
 receive a detailed report:
 
-```text
-python snort_suricata_rule_converter.py convert input.rules --source-dialect snort3 --target suricata --output accepted.rules --allow-partial --rejected-output rejected.rules --report conversion.json
+```powershell
+ids-rule-converter convert input.rules --source-dialect snort3 --target suricata --output accepted.rules --allow-partial --rejected-output rejected.rules --report partial-conversion.json
 ```
+
+From a reviewed source checkout, replace `ids-rule-converter` with
+`python snort_suricata_rule_converter.py`. If you downloaded the standalone
+release asset instead, use `python IDS-Rule-Converter-v4.0.2.py` from the
+directory containing that verified file.
 
 An intentional partial result exits with code 2 so automation cannot mistake it
 for a complete conversion.
