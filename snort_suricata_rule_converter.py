@@ -4712,9 +4712,11 @@ def admitted_pax_value(keyword: str, raw_value: bytes, *, global_header: bool) -
             raise ConverterError("TAR PAX integer exceeds its supported numeric policy")
         if keyword == "size" and int(value) > MAX_EXTRACTED_FILE_BYTES:
             raise ConverterError("TAR PAX entry is too large")
-    elif keyword in {"mtime", "atime", "ctime"}:
-        if re.fullmatch(r"-?[0-9]{1,20}(?:\.[0-9]{1,20})?", value) is None:
-            raise ConverterError("TAR PAX timestamp exceeds its supported numeric policy")
+    elif (
+        keyword in {"mtime", "atime", "ctime"}
+        and re.fullmatch(r"-?[0-9]{1,20}(?:\.[0-9]{1,20})?", value) is None
+    ):
+        raise ConverterError("TAR PAX timestamp exceeds its supported numeric policy")
     return value
 
 
