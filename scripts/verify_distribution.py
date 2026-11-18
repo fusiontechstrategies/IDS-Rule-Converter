@@ -27,7 +27,7 @@ APPROVED_BUILD_SYSTEM = {
 }
 APPROVED_PROJECT = {
     "name": "ids-rule-converter",
-    "version": "4.0.2",
+    "version": "4.0.3",
     "description": "Loss-aware Snort and Suricata rule conversion toolkit",
     "readme": "README.md",
     "requires-python": ">=3.12,<3.15",

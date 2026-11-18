@@ -42,8 +42,8 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, BinaryIO
 
 APP_NAME = "IDS Rule Converter"
-VERSION = "4.0.2"
-BUILD_DATE = "2026-09-29"
+VERSION = "4.0.3"
+BUILD_DATE = "2026-11-18"
 
 EXIT_OK = 0
 EXIT_OPERATIONAL_ERROR = 1

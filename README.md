@@ -1,13 +1,13 @@
 # IDS Rule Converter
 
 <p align="center">
-  <img src=".github/assets/social-preview.jpg" width="960" alt="IDS Rule Converter: Translate. Verify. Fail closed.">
+  <img src="https://raw.githubusercontent.com/fusiontechstrategies/IDS-Rule-Converter/refs/heads/main/.github/assets/social-preview.jpg" width="960" alt="IDS Rule Converter: Translate. Verify. Fail closed.">
 </p>
 
 [![CI](https://github.com/fusiontechstrategies/IDS-Rule-Converter/actions/workflows/ci.yml/badge.svg)](https://github.com/fusiontechstrategies/IDS-Rule-Converter/actions/workflows/ci.yml)
 [![Engine Validation](https://github.com/fusiontechstrategies/IDS-Rule-Converter/actions/workflows/engine-validation.yml/badge.svg)](https://github.com/fusiontechstrategies/IDS-Rule-Converter/actions/workflows/engine-validation.yml)
 [![Security](https://github.com/fusiontechstrategies/IDS-Rule-Converter/actions/workflows/security.yml/badge.svg)](https://github.com/fusiontechstrategies/IDS-Rule-Converter/actions/workflows/security.yml)
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/fusiontechstrategies/IDS-Rule-Converter/blob/main/LICENSE)
 
 Stop guessing whether a converted IDS rule still means the same thing.
 
@@ -16,27 +16,25 @@ validating, analyzing, comparing, and converting Snort and Suricata rules. It
 defaults to refusing uncertain translations instead of silently dropping or
 weakening detection logic.
 
-> **Project status: maintained public release.** Version 4.0.2 is the current verified release. The converter supports documented Snort 2, Snort 3, and Suricata 8 lanes, but it does not promise that every engine feature has a lossless translation. Rejected and partial results are deliberate safety outcomes.
+Version 4.0.3 is the current release version of this source tree. The converter supports documented Snort 2, Snort 3, and Suricata 8 lanes. Rejected and partial results identify rules whose behavior could not be translated safely.
 
 The runtime has no third-party Python dependencies. Copy
-`snort_suricata_rule_converter.py` to a system with Python 3.12 or newer and run
+`snort_suricata_rule_converter.py` to a system with Python 3.12 through 3.14 and run
 it directly.
 
-Version 4.0.2 is the current release. Download the verified
-[standalone Python runtime](https://github.com/fusiontechstrategies/IDS-Rule-Converter/releases/download/v4.0.2/IDS-Rule-Converter-v4.0.2.py)
-or the deterministic
-[documentation ZIP](https://github.com/fusiontechstrategies/IDS-Rule-Converter/releases/download/v4.0.2/IDS-Rule-Converter-v4.0.2.zip).
-The [release page](https://github.com/fusiontechstrategies/IDS-Rule-Converter/releases/tag/v4.0.2)
-also provides a Python wheel and source archive, the SPDX SBOM, SHA-256 checksums, release evidence, and GitHub
-provenance. See [RELEASING.md](RELEASING.md) for the exact artifact and
+The [published GitHub releases](https://github.com/fusiontechstrategies/IDS-Rule-Converter/releases) provide a standalone runtime,
+operator documentation ZIP, wheel, source archive, SPDX SBOM, SHA-256 checksums,
+release evidence, and GitHub provenance. See [RELEASING.md](https://github.com/fusiontechstrategies/IDS-Rule-Converter/blob/main/RELEASING.md) for the exact artifact and
 publication gates.
 
-For an installed command, use the [PyPI 4.0.2 package](https://pypi.org/project/ids-rule-converter/4.0.2/):
+For an installed command, use the [published PyPI package](https://pypi.org/project/ids-rule-converter/):
 
 ```text
-python -m pip install ids-rule-converter==4.0.2
+python -m pip install ids-rule-converter
 ids-rule-converter --help
 ```
+
+For an exact install, use `python -m pip install ids-rule-converter==4.0.3` once it appears in the [PyPI release history](https://pypi.org/project/ids-rule-converter/#history).
 
 ## Why this tool is different
 
@@ -90,7 +88,7 @@ ids-rule-converter convert input.rules --source-dialect snort3 --target suricata
 
 From a reviewed source checkout, replace `ids-rule-converter` with
 `python snort_suricata_rule_converter.py`. If you downloaded the standalone
-release asset instead, use `python IDS-Rule-Converter-v4.0.2.py` from the
+release asset instead, use `python IDS-Rule-Converter-vX.Y.Z.py` from the
 directory containing that verified file.
 
 An intentional partial result exits with code 2 so automation cannot mistake it
@@ -104,7 +102,7 @@ of the three files is not a single transaction.
 
 ### Strict and reviewed partial results
 
-![Synthetic two-rule IDS conversion comparison showing strict mode writing no ruleset and reviewed partial mode separating one accepted rule, one rejected rule, and a JSON report while returning exit code 2.](docs/images/ids-rule-converter-safety-comparison.png)
+![Synthetic two-rule IDS conversion comparison showing strict mode writing no ruleset and reviewed partial mode separating one accepted rule, one rejected rule, and a JSON report while returning exit code 2.](https://raw.githubusercontent.com/fusiontechstrategies/IDS-Rule-Converter/refs/heads/main/docs/images/ids-rule-converter-safety-comparison.png)
 
 Constructed test data. Strict mode writes no converted ruleset when one mapping
 is unsafe. An explicit partial export preserves accepted rules, rejected source
@@ -127,7 +125,7 @@ Detection engineers can contribute the most by sharing a minimal, anonymized rul
 | `list-sources` | Show built-in HTTPS feed definitions |
 | `fetch` | Download and optionally extract an allowlisted rule feed safely |
 
-See [QUICK_REFERENCE.md](QUICK_REFERENCE.md) for copy-ready examples.
+See [QUICK_REFERENCE.md](https://github.com/fusiontechstrategies/IDS-Rule-Converter/blob/main/QUICK_REFERENCE.md) for copy-ready examples.
 
 ## Conversion safety model
 
@@ -447,7 +445,7 @@ controls, and release construction. It does not change conversion semantics. The
 large third-party corpus has not been rerun for the candidate, so its result is
 kept explicitly separate from the current hosted native-fixture checks. Full
 commands, container digests, and scope are recorded in
-[docs/TESTING.md](docs/TESTING.md).
+[docs/TESTING.md](https://github.com/fusiontechstrategies/IDS-Rule-Converter/blob/main/docs/TESTING.md).
 
 ## Exit codes
 
@@ -460,7 +458,7 @@ commands, container digests, and scope are recorded in
 
 ## Related Fusion projects
 
-- [Fool's Gold](https://github.com/fusiontechstrategies/Fools-Gold) is an offline cyber-decoy detection and assurance pilot seeking real integration validation.
+- [Fool's Gold](https://github.com/fusiontechstrategies/Fools-Gold) evaluates cyber-decoy detection and assurance offline.
 - Explore the complete [Fusion Technology Strategies public portfolio](https://github.com/fusiontechstrategies/FusionTechStrategies).
 
 ## Development
@@ -486,7 +484,7 @@ automation are separate so the executable itself stays portable.
 - Existing outputs are refused unless `--force` is supplied.
 - `--force` cannot replace an input file.
 - Report suspected vulnerabilities through the private process in
-  [SECURITY.md](SECURITY.md).
+  [SECURITY.md](https://github.com/fusiontechstrategies/IDS-Rule-Converter/blob/main/SECURITY.md).
 
 ## License
 

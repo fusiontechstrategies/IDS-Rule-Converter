@@ -10,7 +10,7 @@ import test_security_regressions as fixtures
 from scripts import normalize_sdist, normalize_wheel, prepare_release, verify_release_handoff
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "4.0.2"
+VERSION = "4.0.3"
 COMMIT = "a" * 40
 EPOCH = 1767225600
 
@@ -46,7 +46,7 @@ class TrustedReleasePromotionTests(unittest.TestCase):
             source = root / "source"
             names = set(prepare_release.PACKAGE_FILES) | {
                 "pyproject.toml",
-                ".github/release-notes/v4.0.2.md",
+                ".github/release-notes/v4.0.3.md",
             }
             names.update(p.relative_to(ROOT).as_posix() for p in (ROOT / "tests").glob("test_*.py"))
             for name in names:

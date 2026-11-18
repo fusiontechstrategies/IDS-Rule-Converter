@@ -10,7 +10,7 @@ from pathlib import Path
 from scripts import prepare_release
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-VERSION = "4.0.2"
+VERSION = "4.0.3"
 SOURCE_COMMIT = "a" * 40
 
 
@@ -112,7 +112,7 @@ class ReleasePreparationTests(unittest.TestCase):
                 prepare_release.prepare_release(
                     PROJECT_ROOT,
                     parent / "mismatch",
-                    "4.0.3",
+                    "0.0.0",
                     SOURCE_COMMIT,
                     self.distribution_fixture(parent),
                 )

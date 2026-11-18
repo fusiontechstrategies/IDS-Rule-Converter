@@ -15,9 +15,13 @@ ALT_TEXT = (
 
 
 class ReadmeVisualTests(unittest.TestCase):
-    def test_readme_references_the_local_safety_visual(self) -> None:
+    def test_readme_uses_a_public_url_for_the_packaged_safety_visual(self) -> None:
         readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
-        expected = f"![{ALT_TEXT}](docs/images/ids-rule-converter-safety-comparison.png)"
+        image_url = (
+            "https://raw.githubusercontent.com/fusiontechstrategies/IDS-Rule-Converter/refs/heads/main/"
+            + PNG_PATH.relative_to(PROJECT_ROOT).as_posix()
+        )
+        expected = f"![{ALT_TEXT}]({image_url})"
         self.assertIn(expected, readme)
         self.assertLess(
             readme.index(expected),
