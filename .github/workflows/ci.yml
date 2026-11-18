@@ -93,7 +93,7 @@ jobs:
           python -m build --no-isolation --wheel --sdist --outdir package-dist
           python scripts/normalize_wheel.py --source-date-epoch "$epoch" package-dist/*.whl
           python scripts/normalize_sdist.py --source-date-epoch "$epoch" package-dist/*.tar.gz
-          python scripts/verify_distribution.py package-dist --version 4.0.2
+          python scripts/verify_distribution.py package-dist --version 4.0.3
           python -m twine check package-dist/*
 
       - name: Build candidate twice
@@ -101,12 +101,12 @@ jobs:
         run: |
           set -euo pipefail
           python scripts/prepare_release.py \
-            --version 4.0.2 \
+            --version 4.0.3 \
             --source-commit "$GITHUB_SHA" \
             --dist-dir package-dist \
             --output-dir candidate-one
           python scripts/prepare_release.py \
-            --version 4.0.2 \
+            --version 4.0.3 \
             --source-commit "$GITHUB_SHA" \
             --dist-dir package-dist \
             --output-dir candidate-two
@@ -117,11 +117,11 @@ jobs:
           set -euo pipefail
           diff --recursive --brief candidate-one candidate-two
           test "$(find candidate-one -maxdepth 1 -type f | wc -l)" -eq 7
-          test -f candidate-one/IDS-Rule-Converter-v4.0.2.py
-          test -f candidate-one/IDS-Rule-Converter-v4.0.2.zip
-          test -f candidate-one/ids_rule_converter-4.0.2-py3-none-any.whl
-          test -f candidate-one/ids_rule_converter-4.0.2.tar.gz
-          test -f candidate-one/IDS-Rule-Converter-v4.0.2.spdx.json
+          test -f candidate-one/IDS-Rule-Converter-v4.0.3.py
+          test -f candidate-one/IDS-Rule-Converter-v4.0.3.zip
+          test -f candidate-one/ids_rule_converter-4.0.3-py3-none-any.whl
+          test -f candidate-one/ids_rule_converter-4.0.3.tar.gz
+          test -f candidate-one/IDS-Rule-Converter-v4.0.3.spdx.json
           test -f candidate-one/SHA256SUMS.txt
           test -f candidate-one/release-evidence.json
 
@@ -167,7 +167,7 @@ jobs:
           python -m build --no-isolation --wheel --sdist --outdir package-dist
           python scripts/normalize_wheel.py --source-date-epoch "$epoch" package-dist/*.whl
           python scripts/normalize_sdist.py --source-date-epoch "$epoch" package-dist/*.tar.gz
-          python scripts/verify_distribution.py package-dist --version 4.0.2
+          python scripts/verify_distribution.py package-dist --version 4.0.3
           python -m twine check package-dist/*
           python -m build --no-isolation --wheel --sdist --outdir package-repeat
           python scripts/normalize_wheel.py --source-date-epoch "$epoch" package-repeat/*.whl

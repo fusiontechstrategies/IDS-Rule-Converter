@@ -6,6 +6,15 @@ The format follows Keep a Changelog, and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [4.0.3] - 2026-11-18
+
+### Changed
+
+- Aligned the PyPI description and exact install pin with the packaged version, and made documentation links usable from the package index.
+- Updated the supported source and package runtimes to Python 3.12 through 3.14.
+- Tightened rule admission and HTTP and SIP buffer handling. Review rejected rules when migrating a previously accepted ruleset.
+- Made partial-output handling more conservative and tightened archive and feed limits.
+
 ## [4.0.2] - 2026-09-29
 
 ### Added
@@ -69,4 +78,5 @@ The format follows Keep a Changelog, and versions follow Semantic Versioning.
 [4.0.1]: https://github.com/fusiontechstrategies/IDS-Rule-Converter/compare/v4.0.0...v4.0.1
 [4.0.0]: https://github.com/fusiontechstrategies/IDS-Rule-Converter/releases/tag/v4.0.0
 [4.0.2]: https://github.com/fusiontechstrategies/IDS-Rule-Converter/compare/v4.0.1...v4.0.2
-[Unreleased]: https://github.com/fusiontechstrategies/IDS-Rule-Converter/compare/v4.0.2...HEAD
+[4.0.3]: https://github.com/fusiontechstrategies/IDS-Rule-Converter/compare/v4.0.2...v4.0.3
+[Unreleased]: https://github.com/fusiontechstrategies/IDS-Rule-Converter/compare/v4.0.3...HEAD

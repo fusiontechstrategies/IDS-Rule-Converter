@@ -38,12 +38,12 @@ $epoch = git show -s --format=%ct HEAD
 $env:SOURCE_DATE_EPOCH = $epoch
 python -m pip install -r requirements-build.txt
 python -m build --no-isolation --wheel --sdist --outdir package-dist
-python scripts/normalize_wheel.py --source-date-epoch $epoch package-dist/ids_rule_converter-4.0.2-py3-none-any.whl
-python scripts/normalize_sdist.py --source-date-epoch $epoch package-dist/ids_rule_converter-4.0.2.tar.gz
-python scripts/verify_distribution.py package-dist --version 4.0.2
+python scripts/normalize_wheel.py --source-date-epoch $epoch package-dist/ids_rule_converter-4.0.3-py3-none-any.whl
+python scripts/normalize_sdist.py --source-date-epoch $epoch package-dist/ids_rule_converter-4.0.3.tar.gz
+python scripts/verify_distribution.py package-dist --version 4.0.3
 python -m twine check package-dist/*
 python scripts/prepare_release.py `
-  --version 4.0.2 `
+  --version 4.0.3 `
   --source-commit $commit `
   --dist-dir .\package-dist `
   --output-dir .\candidate

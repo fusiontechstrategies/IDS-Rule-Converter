@@ -17,7 +17,7 @@ import snort_suricata_rule_converter as app
 from scripts import normalize_sdist, normalize_wheel, prepare_release, verify_release_handoff
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION, COMMIT, EPOCH = "4.0.2", "a" * 40, 1767225600
+VERSION, COMMIT, EPOCH = "4.0.3", "a" * 40, 1767225600
 RULE = 'alert tcp any any -> any any (content:"marker"; sid:1001;)'
 
 

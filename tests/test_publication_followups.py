@@ -63,7 +63,7 @@ class PublicationFollowups(unittest.TestCase):
                     contents = "".join(lines)
                 rewrite_wheel(wheel, {name: contents.encode()})
                 with self.assertRaises(ValueError):
-                    verify_distribution.verify_distribution(root, fixtures.ROOT, "4.0.2")
+                    verify_distribution.verify_distribution(root, fixtures.ROOT, "4.0.3")
 
     def test_sdist_empty_unreviewed_and_nonportable_directories_rejected(self):
         for name in ("unreviewed", "NUL", "trailing.", "name ", "a:b"):
@@ -75,11 +75,11 @@ class PublicationFollowups(unittest.TestCase):
                 with tarfile.open(sdist, "w:gz") as archive:
                     for member, data in members:
                         archive.addfile(member, io.BytesIO(data))
-                    extra = tarfile.TarInfo("ids_rule_converter-4.0.2/" + name)
+                    extra = tarfile.TarInfo("ids_rule_converter-4.0.3/" + name)
                     extra.type = tarfile.DIRTYPE
                     archive.addfile(extra)
                 with self.assertRaises(ValueError):
-                    verify_distribution.verify_distribution(root, fixtures.ROOT, "4.0.2")
+                    verify_distribution.verify_distribution(root, fixtures.ROOT, "4.0.3")
 
     def test_copied_dist_bytes_are_bound_to_original_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -103,7 +103,7 @@ class PublicationFollowups(unittest.TestCase):
         commit = "a" * 40
         environment = {
             "GH_REPO": "owner/repo",
-            "RELEASE_TAG": "v4.0.2",
+            "RELEASE_TAG": "v4.0.3",
             "VERIFIED_COMMIT": commit,
             "VERIFIED_RELEASE_ID": "123",
         }
@@ -137,7 +137,7 @@ class PublicationFollowups(unittest.TestCase):
                         value = {
                             "id": 124 if mutation == "release" else 123,
                             "immutable": mutation != "mutable",
-                            "tag_name": "v4.0.2",
+                            "tag_name": "v4.0.3",
                             "draft": mutation == "draft",
                             "prerelease": mutation == "prerelease",
                         }

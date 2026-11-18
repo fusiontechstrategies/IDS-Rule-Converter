@@ -152,7 +152,7 @@ class SecurityRegressions(unittest.TestCase):
         import email
 
         metadata = email.message_from_string(
-            "Metadata-Version: 2.4\nName: ids-rule-converter\nVersion: 4.0.2\n"
+            "Metadata-Version: 2.4\nName: ids-rule-converter\nVersion: 4.0.3\n"
             "Requires-Python: <3.15,>=3.12\nDescription-Content-Type: text/markdown\n"
             "License-Expression: Apache-2.0\nLicense-File: LICENSE\nProvides-Extra: unreviewed\n"
         )
@@ -297,7 +297,7 @@ class SecurityRegressions(unittest.TestCase):
                 converter.extract_archive(b"", "tar.gz", link, force=True)
 
     def fixture_distributions(self, directory):
-        version = "4.0.2"
+        version = "4.0.3"
         wheel = directory / f"ids_rule_converter-{version}-py3-none-any.whl"
         sdist = directory / f"ids_rule_converter-{version}.tar.gz"
         metadata = f"Metadata-Version: 2.4\nName: ids-rule-converter\nVersion: {version}\nRequires-Python: <3.15,>=3.12\nDescription-Content-Type: text/markdown\nLicense-Expression: Apache-2.0\nLicense-File: LICENSE\n"
@@ -362,11 +362,11 @@ class SecurityRegressions(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             wheel, _ = self.fixture_distributions(root)
-            verify_distribution.verify_distribution(root, ROOT, "4.0.2")
+            verify_distribution.verify_distribution(root, ROOT, "4.0.3")
             with zipfile.ZipFile(wheel, "a") as archive:
                 archive.writestr("startup.pth", "import malicious")
             with self.assertRaisesRegex(ValueError, "unreviewed installation members"):
-                verify_distribution.verify_distribution(root, ROOT, "4.0.2")
+                verify_distribution.verify_distribution(root, ROOT, "4.0.3")
 
     def test_installation_active_extra_sdist_member_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -377,7 +377,7 @@ class SecurityRegressions(unittest.TestCase):
             with tarfile.open(sdist, "w:gz") as archive:
                 for member, data in members:
                     archive.addfile(member, io.BytesIO(data))
-                extra = tarfile.TarInfo("ids_rule_converter-4.0.2/setup.py")
+                extra = tarfile.TarInfo("ids_rule_converter-4.0.3/setup.py")
                 archive.addfile(extra)
             with self.assertRaisesRegex(ValueError, "unreviewed installation members"):
-                verify_distribution.verify_distribution(root, ROOT, "4.0.2")
+                verify_distribution.verify_distribution(root, ROOT, "4.0.3")

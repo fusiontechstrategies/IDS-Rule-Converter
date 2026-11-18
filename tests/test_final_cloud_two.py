@@ -85,7 +85,7 @@ class InstallationContractTests(unittest.TestCase):
         for section, key, value in (
             ("project", "scripts", {"ids-rule-converter": "another_module:main"}),
             ("project", "entry-points", {"plugin": {"selected": "another_module:main"}}),
-            ("project", "version", "4.0.3"),
+            ("project", "version", "0.0.0"),
             ("project", "requires-python", ">=3.10"),
             ("tool", "setuptools", {"py-modules": ["another_module"]}),
             (
@@ -107,7 +107,7 @@ class InstallationContractTests(unittest.TestCase):
             original.replace(b'"wheel==0.48.0"', b'"wheel==0.48.0", "extra-package==1.0"')
         )
         with self.assertRaisesRegex(ValueError, "build-system"):
-            verifier.verify_distribution(dist, source, "4.0.2")
+            verifier.verify_distribution(dist, source, "4.0.3")
         dist.iterdir.assert_not_called()
 
     def test_ordinary_distribution_metadata_and_trusted_handoff_remain_supported(self):
@@ -116,14 +116,14 @@ class InstallationContractTests(unittest.TestCase):
             dist = root / "dist"
             dist.mkdir()
             wheel, sdist = fixtures.SecurityRegressions().fixture_distributions(dist)
-            self.assertEqual(verifier.verify_distribution(dist, ROOT, "4.0.2"), (wheel, sdist))
+            self.assertEqual(verifier.verify_distribution(dist, ROOT, "4.0.3"), (wheel, sdist))
             epoch = 1767225600
             normalize_wheel.normalize_wheel(wheel, epoch)
             normalize_sdist.normalize_sdist(sdist, epoch)
             assets = root / "assets"
-            prepare_release.prepare_release(ROOT, assets, "4.0.2", "a" * 40, dist)
+            prepare_release.prepare_release(ROOT, assets, "4.0.3", "a" * 40, dist)
             result = verify_release_handoff.verify_handoff(assets, ROOT, "a" * 40, epoch)
-            self.assertEqual(result["tag"], "v4.0.2")
+            self.assertEqual(result["tag"], "v4.0.3")
             self.assertEqual(len(result["manifest"]), 7)
 
 
