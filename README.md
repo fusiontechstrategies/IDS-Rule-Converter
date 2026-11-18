@@ -458,7 +458,7 @@ commands, container digests, and scope are recorded in
 
 ## Related Fusion projects
 
-- [Fool's Gold](https://github.com/fusiontechstrategies/Fools-Gold) is an offline cyber-decoy detection and assurance pilot seeking real integration validation.
+- [Fool's Gold](https://github.com/fusiontechstrategies/Fools-Gold) evaluates cyber-decoy detection and assurance offline.
 - Explore the complete [Fusion Technology Strategies public portfolio](https://github.com/fusiontechstrategies/FusionTechStrategies).
 
 ## Development
